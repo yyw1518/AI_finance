@@ -29,7 +29,7 @@ st.info(
 # =========================================================
 # 설정
 # =========================================================
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3-flash-preview"
 MAX_IMAGES = 6
 MAX_INLINE_BYTES = 18 * 1024 * 1024  # 18MB: API 20MB inline 한도보다 여유 있게
 
