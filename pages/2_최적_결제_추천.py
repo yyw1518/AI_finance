@@ -261,7 +261,28 @@ PAYMENT_METHODS = {"card", "easy_pay"}
 PAYMENT_RELATED = {"card", "easy_pay", "point"}
 
 
+def relation_key(a, b):
+    ids = sorted([str(a.get("id", "")), str(b.get("id", ""))])
+    return "||".join(ids)
+
+
 def pair_compatibility(a, b):
+    # 사용자가 직접 확인한 정보가 가장 우선
+    user_relations = st.session_state.get("benefit_relations", {})
+    saved = user_relations.get(relation_key(a, b))
+
+    if saved == "possible":
+        return "confirmed"
+    if saved == "not_possible":
+        return "invalid"
+
+    # AI가 같은 택일 그룹으로 판단한 혜택은 함께 사용하지 않음
+    group_a = str(a.get("exclusive_group", "")).strip()
+    group_b = str(b.get("exclusive_group", "")).strip()
+
+    if group_a and group_b and group_a == group_b:
+        return "invalid"
+
     ca = normalize_category(a)
     cb = normalize_category(b)
 
@@ -273,12 +294,24 @@ def pair_compatibility(a, b):
     if ca == "membership" and cb == "membership":
         return "invalid"
 
+    # 같은 제공사 여부
+    issuer_a = str(a.get("issuer", "")).strip()
+    issuer_b = str(b.get("issuer", "")).strip()
+    same_issuer = bool(issuer_a and issuer_b and issuer_a == issuer_b)
+
     # 쿠폰 + 쿠폰
+    # 둘 다 '쿠폰 중복 가능'이 명확히 확인된 경우에만 함께 사용
     if ca == "coupon" and cb == "coupon":
-        return merge_status(
-            relation_value(a.get("stack_coupon")),
-            relation_value(b.get("stack_coupon")),
-        )
+        a_stack = a.get("stack_coupon")
+        b_stack = b.get("stack_coupon")
+
+        if a_stack is True and b_stack is True:
+            return "confirmed"
+
+        if a_stack is False or b_stack is False:
+            return "invalid"
+
+        return "uncertain"
 
     # 쿠폰 + 멤버십
     if {ca, cb} == {"coupon", "membership"}:
@@ -339,6 +372,16 @@ def pair_compatibility(a, b):
     return "uncertain"
 
 
+def get_uncertain_pairs(selected_benefits):
+    pairs = []
+
+    for a, b in itertools.combinations(selected_benefits, 2):
+        if pair_compatibility(a, b) == "uncertain":
+            pairs.append((a, b))
+
+    return pairs
+
+
 def subset_compatibility(selected_benefits):
     status = "confirmed"
 
@@ -361,72 +404,42 @@ def individual_benefit_check(benefit):
     status = "confirmed"
     reasons = []
 
+    name = benefit.get("name", "혜택")
+
     # 사용 채널
     label = str(benefit.get("channel_label", "확인 필요")).strip()
-
-    if label == "온·오프라인":
-        pass
-    elif label == "온라인":
-        if purchase_channel != "온라인":
-            return "invalid", ["온라인 전용 혜택입니다."]
-    elif label == "오프라인":
-        if purchase_channel != "오프라인":
-            return "invalid", ["오프라인 전용 혜택입니다."]
-    else:
-        status = "uncertain"
-        reasons.append(f"{benefit.get('name', '혜택')}: 사용 채널 확인 필요")
+    if label == "온라인" and purchase_channel != "온라인":
+        return "invalid", [f"{name}: 온라인 전용 혜택입니다."]
+    if label == "오프라인" and purchase_channel != "오프라인":
+        return "invalid", [f"{name}: 오프라인 전용 혜택입니다."]
 
     # 유효기간
     raw_expiry = str(benefit.get("expiry", "")).strip()
-
     if raw_expiry:
         try:
             expiry_date = datetime.strptime(raw_expiry, "%Y-%m-%d").date()
-
             if expiry_date < date.today():
-                return "invalid", [f"{benefit.get('name', '혜택')}: 유효기간이 지났습니다."]
+                return "invalid", [f"{name}: 유효기간이 지났습니다."]
         except ValueError:
             status = "uncertain"
-            reasons.append(f"{benefit.get('name', '혜택')}: 유효기간 형식 확인 필요")
+            reasons.append(f"{name}: 유효기간을 확인해주세요.")
 
-    # AI가 숫자를 확실히 읽지 못한 경우
+    # 실제 결제 가능성에 직접 영향을 주는 조건만 안내
     if not benefit.get("value_known", True):
         status = "uncertain"
-        reasons.append(f"{benefit.get('name', '혜택')}: 할인·적립 금액 확인 필요")
-
-    if not benefit.get("min_purchase_known", True):
-        status = "uncertain"
-        reasons.append(f"{benefit.get('name', '혜택')}: 최소 결제금액 확인 필요")
-
-    if not benefit.get("max_discount_known", True):
-        status = "uncertain"
-        reasons.append(f"{benefit.get('name', '혜택')}: 최대 할인·적립 한도 확인 필요")
-
-    # 중복/최소금액 기준 등 상세조건
-    if benefit.get("min_purchase_basis", "unknown") == "unknown":
-        status = "uncertain"
-        reasons.append(f"{benefit.get('name', '혜택')}: 최소 결제금액 판단 기준 확인 필요")
+        reasons.append(f"{name}: 혜택 금액을 확인해주세요.")
 
     required_payment = str(benefit.get("required_payment_method", "")).strip()
     if required_payment:
         status = "uncertain"
-        reasons.append(
-            f"{benefit.get('name', '혜택')}: 필수 결제수단 조건 확인 필요 ({required_payment})"
-        )
+        reasons.append(f"{name}: {required_payment} 결제 조건을 확인해주세요.")
 
     excluded_items = str(benefit.get("excluded_items", "")).strip()
     if excluded_items:
         status = "uncertain"
-        reasons.append(
-            f"{benefit.get('name', '혜택')}: 제외 상품 조건 확인 필요 ({excluded_items})"
-        )
+        reasons.append(f"{name}: 제외 상품 여부를 확인해주세요.")
 
-    conditions = str(benefit.get("conditions", "")).strip()
-    if conditions:
-        status = "uncertain"
-        # 너무 긴 내부 메모를 그대로 노출하지 않고 이름 기준으로 안내
-        reasons.append(f"{benefit.get('name', '혜택')}: 기타 행사 조건 확인 필요")
-
+    # 중복 정보가 불명확한 경우는 조합 단계에서 한 번만 표시
     return status, reasons
 
 
@@ -648,9 +661,11 @@ def calculate_group_plans(group_indices):
         if skip:
             continue
 
+        pair_questions = get_uncertain_pairs(selected)
+
         # 중복 관계가 불명확한 경우
         if compatibility == "uncertain" and selected:
-            reasons.append("선택한 혜택 사이의 중복 적용 가능 여부를 확인해주세요.")
+            reasons.append("선택한 혜택들의 중복 적용 가능 여부를 확인해주세요.")
 
         applied = apply_benefit_subset(starting_price, selected)
 
@@ -666,10 +681,10 @@ def calculate_group_plans(group_indices):
             if reuse_type != "reusable":
                 consumed_mask |= (1 << idx)
 
-            if reuse_type == "unknown":
+            if reuse_type == "unknown" and len(group_indices) < len(products):
                 status = "uncertain"
                 reasons.append(
-                    f"{benefits[idx].get('name', '혜택')}: 분할결제 시 재사용 가능 여부를 확인해주세요."
+                    f"{benefits[idx].get('name', '혜택')}: 분할결제 재사용 여부를 확인해주세요."
                 )
 
         plans.append(
@@ -686,6 +701,15 @@ def calculate_group_plans(group_indices):
                 "steps": applied["steps"],
                 "benefit_names": [b.get("name", "혜택") for b in selected],
                 "uncertain_reasons": unique_text(reasons),
+                "uncertain_pairs": [
+                    {
+                        "a_id": a.get("id"),
+                        "a_name": a.get("name", "혜택 A"),
+                        "b_id": b.get("id"),
+                        "b_name": b.get("name", "혜택 B"),
+                    }
+                    for a, b in pair_questions
+                ],
             }
         )
 
@@ -756,6 +780,7 @@ def best_for_partition(partition, allow_uncertain=True, k=8):
                 "choices": [],
                 "uncertain_count": 0,
                 "uncertain_reasons": [],
+                "uncertain_pairs": [],
             }
         ]
     }
@@ -802,6 +827,7 @@ def best_for_partition(partition, allow_uncertain=True, k=8):
                         "uncertain_reasons": unique_text(
                             state["uncertain_reasons"] + plan["uncertain_reasons"]
                         ),
+                        "uncertain_pairs": state["uncertain_pairs"] + plan.get("uncertain_pairs", []),
                     }
 
                     bucket = new_states.setdefault(new_mask, [])
@@ -933,7 +959,7 @@ def total_benefit_value(option):
 
 
 # =========================================================
-# 1. 가장 중요한 한 줄 결과
+# 1. 핵심 결과
 # =========================================================
 st.header("🏆 가장 유리한 결제 방법")
 
@@ -948,198 +974,187 @@ benefit_rate = (
     else 0
 )
 
+# 핵심 숫자는 한 줄로
 c1, arrow_col, c2, c3 = st.columns([1.15, 0.18, 1.25, 1.45])
 
 with c1:
-    st.markdown("##### 상품 총액")
+    st.caption("상품 총액")
     st.markdown(f"## {money(total_original_price)}")
 
 with arrow_col:
     st.markdown("<br><h2 style='text-align:center;'>→</h2>", unsafe_allow_html=True)
 
 with c2:
-    st.markdown("##### 최종 결제금액")
+    st.caption("최종 결제금액")
     st.markdown(f"## **{money(final_payment)}**")
 
 with c3:
-    st.markdown("##### 총 혜택")
+    st.caption("총 혜택")
     st.markdown(f"## **{money(total_benefit)}**")
-    st.caption(f"상품 총액 대비 {percent(benefit_rate)}")
+    st.caption(f"{percent(benefit_rate)} 절약 효과")
 
 if reward_value > 0:
     st.success(
-        f"💡 즉시 할인 **{money(immediate_saving)}** + "
-        f"적립 예상 **{reward_value:,.0f}P** = "
-        f"총 혜택 가치 **{money(total_benefit)}**"
+        f"즉시 할인 **{money(immediate_saving)}** + "
+        f"적립 예상 **{reward_value:,.0f}P**"
     )
 else:
-    st.success(
-        f"🎉 이 방법을 사용하면 총 **{money(immediate_saving)}** 절약할 수 있습니다."
-    )
+    st.success(f"총 **{money(immediate_saving)}** 절약할 수 있습니다.")
 
 
 # =========================================================
-# 2. 실제로 어떻게 결제할지
+# 2. 실제 결제 방법 — 짧고 따라 하기 쉽게
 # =========================================================
 st.subheader("💳 이렇게 결제하세요")
-
-st.write(f"**추천 방식: {payment_style_text(best_option)}**")
+st.write(f"**{payment_style_text(best_option)}**")
 
 for payment_no, choice in enumerate(best_option["choices"], start=1):
-    group = choice["group"]
     plan = choice["plan"]
-    names = group_product_names(group)
+    names = group_product_names(choice["group"])
 
     with st.container(border=True):
-        st.markdown(
-            f"### 결제 {payment_no}. {' + '.join(names)}"
-        )
-        st.caption(f"상품금액 {money(plan['starting_price'])}")
-
-        if not plan["steps"]:
-            st.write("적용 혜택 없이 결제합니다.")
-
+        # 상품이 많을 땐 이름을 길게 헤더로 쓰지 않음
+        if len(names) == 1:
+            st.markdown(f"**결제 {payment_no}. {names[0]}**")
         else:
-            for step_no, step in enumerate(plan["steps"], start=1):
+            st.markdown(f"**결제 {payment_no}. 상품 {len(names)}개 함께 결제**")
+            st.caption(" · ".join(names))
+
+        if plan["steps"]:
+            for step in plan["steps"]:
                 if step["discount"] > 0:
-                    st.write(
-                        f"{step_no}. **{step['name']}** → "
-                        f"{money(step['discount'])} 할인"
-                    )
+                    st.write(f"→ **{step['name']}** · {money(step['discount'])} 할인")
                 elif step["reward"] > 0:
-                    st.write(
-                        f"{step_no}. **{step['name']}** → "
-                        f"{step['reward']:,.0f}P 적립 예상"
-                    )
+                    st.write(f"→ **{step['name']}** · {step['reward']:,.0f}P 적립")
+        else:
+            st.write("→ 적용 혜택 없음")
 
-        st.markdown(
-            f"**이 결제 건 실제 결제금액: {money(plan['payment_price'])}**"
-        )
-
+        payment_line = f"**실제 결제 {money(plan['payment_price'])}**"
         if plan["reward_value"] > 0:
-            st.caption(
-                f"결제 후 예상 적립: {plan['reward_value']:,.0f}P"
-            )
+            payment_line += f" · 결제 후 **{plan['reward_value']:,.0f}P 적립 예상**"
+
+        st.markdown(payment_line)
 
 
 # =========================================================
-# 3. 확인이 필요한 조건
+# 3. 중복 여부 직접 확인
 # =========================================================
-if best_option["uncertain_count"] > 0:
+pair_questions = []
+seen_pair_keys = set()
+
+for pair in best_option.get("uncertain_pairs", []):
+    key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
+
+    if key and key not in seen_pair_keys:
+        seen_pair_keys.add(key)
+        pair_questions.append(pair)
+
+if pair_questions:
     st.warning(
-        "⚠️ 이 추천에는 사진만으로 확정하기 어려운 조건이 포함되어 있습니다. "
-        "아래 항목만 결제 전에 확인해주세요."
+        "⚠️ 중복 사용 여부를 확인하면 추천을 더 정확하게 다시 계산할 수 있습니다."
     )
 
-    with st.expander(
-        f"확인할 조건 {len(best_option['uncertain_reasons'])}개 보기",
-        expanded=True,
-    ):
-        for reason in best_option["uncertain_reasons"]:
-            st.write(f"- {reason}")
+    for idx, pair in enumerate(pair_questions[:3]):
+        key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
+        current_value = st.session_state.get("benefit_relations", {}).get(key)
 
+        default_index = 0
+        if current_value == "possible":
+            default_index = 1
+        elif current_value == "not_possible":
+            default_index = 2
+
+        answer = st.radio(
+            f"{pair['a_name']} + {pair['b_name']}",
+            ["아직 모르겠어요", "중복 가능", "중복 불가"],
+            index=default_index,
+            horizontal=True,
+            key=f"relation_{idx}_{key}",
+        )
+
+        new_value = None
+        if answer == "중복 가능":
+            new_value = "possible"
+        elif answer == "중복 불가":
+            new_value = "not_possible"
+
+        if new_value is not None and new_value != current_value:
+            relations = st.session_state.get("benefit_relations", {}).copy()
+            relations[key] = new_value
+            st.session_state["benefit_relations"] = relations
+            st.success("확인 결과를 반영해 다시 계산합니다.")
+            st.rerun()
+
+# =========================================================
+# 4. 그 밖의 확인할 조건
+# =========================================================
+if best_option["uncertain_count"] > 0:
+    reasons = unique_text(best_option["uncertain_reasons"])
+
+    st.warning("⚠️ 결제 전에 아래 조건만 확인해주세요.")
+
+    for reason in reasons[:3]:
+        st.write(f"- {reason}")
+
+    if len(reasons) > 3:
+        with st.expander(f"추가 확인사항 {len(reasons) - 3}개"):
+            for reason in reasons[3:]:
+                st.write(f"- {reason}")
 else:
-    st.success("✅ 현재 입력 정보만으로 조건을 확정할 수 있는 추천안입니다.")
+    st.success("✅ 현재 입력 정보 기준으로 바로 적용 가능한 결제안입니다.")
 
 
 # =========================================================
-# 4. 안전하게 확정 가능한 방법
+# 4. 다른 방법 — 한 곳에 접어서 표시
 # =========================================================
 confirmed_alternative = None
-
 for option in ranked_confirmed:
     if option_signature(option) != option_signature(best_option):
         confirmed_alternative = option
         break
 
-if (
-    best_option["uncertain_count"] > 0
-    and confirmed_alternative is not None
-):
-    st.subheader("🛡️ 조건 확인 없이 바로 선택할 수 있는 방법")
-
-    confirmed_benefit = total_benefit_value(confirmed_alternative)
-
-    st.info(
-        f"**{payment_style_text(confirmed_alternative)} · "
-        f"결제 {money(confirmed_alternative['payment_price'])} · "
-        f"총 혜택 {money(confirmed_benefit)}**\n\n"
-        "위 추천안의 확인 조건이 충족되지 않을 때 사용할 수 있는 안전한 대안입니다."
-    )
-
-
-# =========================================================
-# 5. 다른 대안
-# =========================================================
 alternatives = [
     option
     for option in ranked_options[1:]
     if option_signature(option) != option_signature(best_option)
 ][:2]
 
-if alternatives:
-    st.divider()
-    st.subheader("🔄 다른 결제 방법")
+if confirmed_alternative is not None or alternatives:
+    with st.expander("🔄 다른 결제 방법 보기"):
+        if (
+            best_option["uncertain_count"] > 0
+            and confirmed_alternative is not None
+        ):
+            st.markdown("**조건 확인 없이 선택할 수 있는 대안**")
+            st.write(
+                f"{payment_style_text(confirmed_alternative)} · "
+                f"결제 **{money(confirmed_alternative['payment_price'])}** · "
+                f"총 혜택 **{money(total_benefit_value(confirmed_alternative))}**"
+            )
+            st.divider()
 
-    for rank, option in enumerate(alternatives, start=2):
-        option_total_benefit = total_benefit_value(option)
-
-        label = (
-            f"{rank}순위 · {payment_style_text(option)} · "
-            f"결제 {money(option['payment_price'])} · "
-            f"총 혜택 {money(option_total_benefit)}"
-        )
-
-        with st.expander(label):
-            names = used_benefit_names(option)
-
-            if names:
-                st.write("**사용 혜택:** " + " · ".join(names))
-            else:
-                st.write("사용 혜택 없음")
-
-            if option["uncertain_count"] > 0:
-                st.caption("⚠️ 일부 조건 확인이 필요한 방법입니다.")
-
-            for payment_no, choice in enumerate(option["choices"], start=1):
-                group_names = group_product_names(choice["group"])
-                plan = choice["plan"]
-
-                st.write(
-                    f"**결제 {payment_no}. {' + '.join(group_names)}** "
-                    f"→ {money(plan['payment_price'])}"
-                )
+        for rank, option in enumerate(alternatives, start=2):
+            st.write(
+                f"**{rank}순위** · {payment_style_text(option)} · "
+                f"결제 **{money(option['payment_price'])}** · "
+                f"총 혜택 **{money(total_benefit_value(option))}**"
+            )
 
 
 # =========================================================
-# 6. 계산 근거는 궁금한 사람만
+# 5. 계산 근거 — 필요할 때만
 # =========================================================
-st.divider()
-
-with st.expander("🧮 왜 이 방법이 가장 유리한가요?"):
+with st.expander("🧮 계산 근거 보기"):
     st.write(
-        "상품 묶음, 분할 결제 여부, 쿠폰·멤버십·카드·간편결제 혜택의 "
-        "최소 결제금액과 중복 조건을 비교해 실질 혜택이 가장 큰 조합을 선택했습니다."
+        "상품 묶음과 분할 결제 여부, 쿠폰·멤버십·결제 혜택의 "
+        "최소 결제금액 및 중복 조건을 비교해 실질 혜택이 가장 큰 방법을 선택했습니다."
     )
-
-    st.write(
-        f"- 상품 총액: **{money(total_original_price)}**"
-    )
-    st.write(
-        f"- 실제 결제 예정액: **{money(final_payment)}**"
-    )
-    st.write(
-        f"- 즉시 할인: **{money(immediate_saving)}**"
-    )
-
+    st.write(f"- 상품 총액: **{money(total_original_price)}**")
+    st.write(f"- 실제 결제 예정액: **{money(final_payment)}**")
+    st.write(f"- 즉시 할인: **{money(immediate_saving)}**")
     if reward_value > 0:
-        st.write(
-            f"- 결제 후 적립 예상: **{reward_value:,.0f}P**"
-        )
-
-    st.write(
-        f"- 총 혜택 가치: **{money(total_benefit)} ({percent(benefit_rate)})**"
-    )
+        st.write(f"- 적립 예상: **{reward_value:,.0f}P**")
+    st.write(f"- 총 혜택 가치: **{money(total_benefit)} ({percent(benefit_rate)})**")
 
 
 # =========================================================
@@ -1152,12 +1167,7 @@ st.session_state["optimized_reward_value"] = reward_value
 st.session_state["optimized_total_benefit"] = total_benefit
 
 st.divider()
-
 st.success(
-    f"✅ 추천 결제금액 **{money(final_payment)}**을 소비 판단 단계에 저장했습니다."
-)
-
-st.write(
-    "이제 **3_소비_판단** 페이지에서 이 실제 결제금액을 기준으로 "
-    "현재 소비 여력을 확인할 수 있습니다."
+    f"✅ 추천 결제금액 **{money(final_payment)}**을 저장했습니다. "
+    "이제 **3_소비_판단**에서 소비 여력을 확인하세요."
 )
