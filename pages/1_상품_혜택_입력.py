@@ -166,8 +166,39 @@ EXTRACTION_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "benefit_relations": {
+            "type": "array",
+            "description": (
+                "추출된 혜택끼리의 중복 가능/불가 관계. "
+                "모든 조합을 억지로 채우지 말고 판단 근거가 있는 관계만 작성."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "benefit_a_name": {"type": "string"},
+                    "benefit_b_name": {"type": "string"},
+                    "relation": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown"],
+                    },
+                    "reason": {"type": "string"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": [
+                    "benefit_a_name",
+                    "benefit_b_name",
+                    "relation",
+                    "reason",
+                    "confidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["store_name", "products", "benefits", "warnings"],
+    "required": ["store_name", "products", "benefits", "warnings", "benefit_relations"],
     "additionalProperties": False,
 }
 
@@ -240,6 +271,40 @@ ANALYSIS_PROMPT = """
 - 혜택 적용 전 최초 결제금액 기준이라고 명확히 보이면 starting_price
 - 다른 할인 적용 후 실제 결제금액 기준이라고 명확히 보이면 before_benefit
 - 불명확하면 unknown
+
+
+[혜택 간 관계 분석 - 매우 중요]
+혜택을 모두 추출한 뒤, 반드시 전체 혜택 목록을 서로 비교하여 관계를 한 번 더 분석한다.
+
+1. 같은 이벤트의 금액대별 혜택
+- 예: 6만원 이상 3천P / 9만원 이상 5천P
+- 예: 5만원 이상 4천원 / 7만원 이상 6천원 / 9만원 이상 9천원
+- 같은 이벤트에서 구매금액 구간에 따라 혜택 하나가 결정되는 구조라면 동시에 더하지 않는다.
+- 각 혜택에 같은 exclusive_group을 부여하고, benefit_relations에도 not_possible 관계를 기록한다.
+
+2. 같은 쿠폰끼리
+- 화면이나 조건에서 '쿠폰 중복 불가', '쿠폰 1장 사용', '타 쿠폰과 중복 불가'가 확인되면 not_possible.
+- 반대로 중복 가능이 명시된 경우에만 possible.
+- 아무 근거가 없으면 unknown.
+
+3. 결제수단 혜택
+- 카드/간편결제 혜택이 결제수단을 하나 선택해야 하는 구조라면 동시에 사용할 수 없는 관계로 판단한다.
+- 동일 결제서비스의 금액대별 보상은 단계형인지 확인하고 단계형이면 not_possible.
+- 단순히 제공사가 같다는 이유만으로 임의 판단하지 않는다.
+
+4. 쿠폰 + 카드/간편결제/멤버십
+- 조건 문구나 이벤트 설명을 종합해 함께 적용 가능한지 판단한다.
+- 문구에 직접 쓰여 있지 않더라도 동일 화면의 구조, '결제 혜택', '쿠폰 적용 후 결제' 등의 문맥으로
+  판단 근거가 충분하면 medium confidence로 추론할 수 있다.
+- 근거가 부족하면 unknown으로 둔다.
+
+5. benefit_relations
+- 모든 가능한 쌍을 나열할 필요는 없다.
+- 계산 결과에 영향을 줄 가능성이 있고, 판단 근거가 있는 관계를 중심으로 작성한다.
+- reason은 사용자에게 보여도 이해할 수 있게 짧은 존댓말 문장으로 작성한다.
+- confidence=high: 화면 문구가 직접 뒷받침함
+- confidence=medium: 이벤트 구조상 합리적으로 판단 가능함
+- confidence=low: 추론 근거가 약함
 
 [기타]
 - 특정 카드/결제수단 필수 조건은 required_payment_method에 적는다.
@@ -523,6 +588,9 @@ if st.button(
                 st.session_state["gemini_products"] = result.get("products", [])
                 st.session_state["gemini_benefits"] = result.get("benefits", [])
                 st.session_state["gemini_warnings"] = result.get("warnings", [])
+                st.session_state["gemini_ai_relations_raw"] = result.get(
+                    "benefit_relations", []
+                )
                 st.session_state["benefit_working_df"] = ai_benefits_to_df(result.get("benefits", []))
                 st.session_state["product_working_df"] = ai_products_to_df(result.get("products", []))
 
@@ -812,6 +880,53 @@ if "gemini_analysis_result" in st.session_state:
             st.session_state["benefits"] = benefits_to_save
             st.session_state["allow_split_payment"] = allow_split_payment
             st.session_state["benefit_input_completed"] = True
+            # Gemini가 판단한 혜택 간 관계를 계산용 relation map으로 변환
+            name_to_ids = {}
+            for benefit in benefits_to_save:
+                name_to_ids.setdefault(benefit["name"], []).append(benefit["id"])
+
+            ai_relation_map = {}
+            ai_relation_meta = {}
+
+            for relation in st.session_state.get("gemini_ai_relations_raw", []):
+                a_name = clean_text(relation.get("benefit_a_name", ""))
+                b_name = clean_text(relation.get("benefit_b_name", ""))
+                relation_value = clean_text(relation.get("relation", "unknown"))
+                confidence = clean_text(relation.get("confidence", "low"))
+                reason = clean_text(relation.get("reason", ""))
+
+                # 같은 이름이 여러 개면 모호하므로 자동 반영하지 않음
+                if (
+                    a_name in name_to_ids
+                    and b_name in name_to_ids
+                    and len(name_to_ids[a_name]) == 1
+                    and len(name_to_ids[b_name]) == 1
+                ):
+                    a_id = name_to_ids[a_name][0]
+                    b_id = name_to_ids[b_name][0]
+                    key = "||".join(sorted([a_id, b_id]))
+
+                    # high/medium만 자동 판단에 활용, low는 사용자 확인 대상으로 남김
+                    if confidence in {"high", "medium"} and relation_value in {
+                        "possible",
+                        "not_possible",
+                    }:
+                        ai_relation_map[key] = relation_value
+
+                    ai_relation_meta[key] = {
+                        "source": "ai",
+                        "relation": relation_value,
+                        "confidence": confidence,
+                        "reason": reason,
+                        "a_name": a_name,
+                        "b_name": b_name,
+                    }
+
+            st.session_state["ai_benefit_relations"] = ai_relation_map
+            st.session_state["ai_benefit_relation_meta"] = ai_relation_meta
+
+            # 새 상품/혜택 분석을 저장하면 이전 구매에서 사용자가 답한 관계는 초기화
+            st.session_state["benefit_relations"] = {}
 
             uncertain_count = sum(
                 1
@@ -831,6 +946,13 @@ if "gemini_analysis_result" in st.session_state:
             st.success(
                 f"✅ 상품 {len(products_to_save)}개, 혜택 {len(benefits_to_save)}개를 저장했습니다."
             )
+            ai_relation_count = len(
+                st.session_state.get("ai_benefit_relations", {})
+            )
+            if ai_relation_count:
+                st.caption(
+                    f"AI가 혜택 간 중복·택일 관계 {ai_relation_count}건도 함께 판단해 저장했습니다."
+                )
 
             if uncertain_count:
                 st.warning(
