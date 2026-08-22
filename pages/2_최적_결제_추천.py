@@ -1,7 +1,272 @@
 import itertools
+import json
 from datetime import date, datetime
 
 import streamlit as st
+from google import genai
+
+
+# =========================================================
+# 사용자 추가 조건 해석
+# =========================================================
+
+USER_CONDITION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "benefit_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target_benefit_name": {"type": "string"},
+                    "eligible_brands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "eligible_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "excluded_items": {"type": "string"},
+                    "required_payment_method": {"type": "string"},
+                    "stack_coupon": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                    "stack_membership": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                    "stack_payment": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                },
+                "required": [
+                    "target_benefit_name",
+                    "eligible_brands",
+                    "eligible_items",
+                    "excluded_items",
+                    "required_payment_method",
+                    "stack_coupon",
+                    "stack_membership",
+                    "stack_payment",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "relation_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "benefit_a_name": {"type": "string"},
+                    "benefit_b_name": {"type": "string"},
+                    "relation": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible"],
+                    },
+                },
+                "required": [
+                    "benefit_a_name",
+                    "benefit_b_name",
+                    "relation",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["benefit_updates", "relation_updates", "summary"],
+    "additionalProperties": False,
+}
+
+
+def user_condition_prompt(note, benefit_names, products_context):
+    return f"""
+너는 쇼핑 혜택 조건을 구조화하는 분석기다.
+
+사용자가 이미 AI가 분석한 혜택에 대해 추가 조건을 자연어로 알려준다.
+사용자의 말은 AI 분석보다 우선하는 확정 정보로 취급한다.
+
+[현재 혜택명]
+{json.dumps(benefit_names, ensure_ascii=False)}
+
+[현재 상품/브랜드]
+{json.dumps(products_context, ensure_ascii=False)}
+
+[사용자 추가 조건]
+{note}
+
+규칙:
+- target_benefit_name은 반드시 현재 혜택명 중 가장 알맞은 이름을 그대로 사용한다.
+- "이 쿠폰은 라운드랩에만 적용돼"라면 해당 쿠폰의 eligible_brands=["라운드랩"].
+- "A 쿠폰은 B 상품에만 적용돼"라면 eligible_items에 B를 넣는다.
+- "A 쿠폰은 다른 쿠폰과 중복 안 돼"라면 stack_coupon="not_possible".
+- "A 쿠폰은 카드 할인과 중복돼"라면 stack_payment="possible".
+- "A 혜택과 B 혜택은 같이 못 써"라면 relation_updates에 두 혜택 관계를 not_possible로 넣는다.
+- 사용자가 말하지 않은 속성은 빈 배열/빈 문자열/no_change로 둔다.
+- 사용자가 어떤 혜택을 가리키는지 합리적으로 특정할 수 없으면 benefit_updates에 억지로 넣지 말고 summary에서 다시 확인이 필요하다고 안내한다.
+- summary는 사용자에게 직접 보여줄 짧은 존댓말 문장으로 작성한다.
+"""
+
+
+GEMINI_CONDITION_MODEL = "gemini-3-flash-preview"
+
+
+def get_condition_client():
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
+
+
+def interpret_condition_on_result(note, current_benefits, current_products):
+    client = get_condition_client()
+
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY가 없습니다.")
+
+    benefit_names = [
+        str(b.get("name", "")).strip()
+        for b in current_benefits
+        if str(b.get("name", "")).strip()
+    ]
+
+    products_context = [
+        {
+            "name": str(p.get("name", "")).strip(),
+            "brand": str(p.get("brand", "")).strip(),
+        }
+        for p in current_products
+    ]
+
+    interaction = client.interactions.create(
+        model=GEMINI_CONDITION_MODEL,
+        input=[
+            {
+                "type": "text",
+                "text": user_condition_prompt(
+                    note,
+                    benefit_names,
+                    products_context,
+                ),
+            }
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": USER_CONDITION_SCHEMA,
+        },
+        store=False,
+    )
+
+    return json.loads(interaction.output_text)
+
+
+def apply_condition_to_saved_benefits(
+    current_benefits,
+    result,
+):
+    updated = [dict(b) for b in current_benefits]
+
+    for update in result.get("benefit_updates", []):
+        target = str(
+            update.get("target_benefit_name", "")
+        ).strip()
+
+        matches = [
+            i
+            for i, benefit in enumerate(updated)
+            if str(benefit.get("name", "")).strip() == target
+        ]
+
+        if len(matches) != 1:
+            continue
+
+        i = matches[0]
+        benefit = updated[i]
+
+        brands = update.get("eligible_brands", []) or []
+        items = update.get("eligible_items", []) or []
+        excluded = str(
+            update.get("excluded_items", "")
+        ).strip()
+        required_payment = str(
+            update.get("required_payment_method", "")
+        ).strip()
+
+        if brands:
+            benefit["eligible_brands"] = brands
+
+        if items:
+            benefit["eligible_items"] = items
+
+        if excluded:
+            benefit["excluded_items"] = excluded
+
+        if required_payment:
+            benefit[
+                "required_payment_method"
+            ] = required_payment
+
+        for source_key, target_key in [
+            ("stack_coupon", "stack_coupon"),
+            ("stack_membership", "stack_membership"),
+            ("stack_payment", "stack_payment"),
+        ]:
+            value = update.get(source_key, "no_change")
+
+            if value == "possible":
+                benefit[target_key] = True
+            elif value == "not_possible":
+                benefit[target_key] = False
+            elif value == "unknown":
+                benefit[target_key] = None
+
+    return updated
+
+
+def relation_updates_to_map(
+    relation_updates,
+    current_benefits,
+):
+    name_to_ids = {}
+
+    for benefit in current_benefits:
+        name_to_ids.setdefault(
+            benefit.get("name", ""),
+            [],
+        ).append(benefit.get("id"))
+
+    relations = st.session_state.get(
+        "benefit_relations",
+        {},
+    ).copy()
+
+    for relation in relation_updates:
+        a_name = relation.get("benefit_a_name", "")
+        b_name = relation.get("benefit_b_name", "")
+        value = relation.get("relation")
+
+        if (
+            a_name in name_to_ids
+            and b_name in name_to_ids
+            and len(name_to_ids[a_name]) == 1
+            and len(name_to_ids[b_name]) == 1
+        ):
+            key = "||".join(
+                sorted([
+                    str(name_to_ids[a_name][0]),
+                    str(name_to_ids[b_name][0]),
+                ])
+            )
+
+            if value in {"possible", "not_possible"}:
+                relations[key] = value
+
+    return relations
 
 
 # =========================================================
@@ -130,6 +395,59 @@ def product_line_total(product):
 
 def group_subtotal(group_indices):
     return sum(product_line_total(products[i]) for i in group_indices)
+
+
+def normalize_text(value):
+    return str(value or "").strip().lower().replace(" ", "")
+
+
+def benefit_target_indices(group_indices, benefit):
+    """혜택이 실제 적용되는 상품 인덱스만 반환."""
+    eligible_brands = benefit.get("eligible_brands", []) or []
+    eligible_items = benefit.get("eligible_items", []) or []
+
+    # 전체 적용 혜택
+    if not eligible_brands and not eligible_items:
+        return list(group_indices)
+
+    brand_targets = {normalize_text(x) for x in eligible_brands if normalize_text(x)}
+    item_targets = {normalize_text(x) for x in eligible_items if normalize_text(x)}
+
+    matched = []
+
+    for i in group_indices:
+        product = products[i]
+        product_brand = normalize_text(product.get("brand", ""))
+        product_name = normalize_text(product.get("name", ""))
+
+        brand_match = (
+            bool(brand_targets)
+            and (
+                product_brand in brand_targets
+                or any(target in product_brand or product_brand in target for target in brand_targets if product_brand)
+            )
+        )
+
+        item_match = (
+            bool(item_targets)
+            and any(
+                target in product_name or product_name in target
+                for target in item_targets
+                if product_name
+            )
+        )
+
+        if brand_match or item_match:
+            matched.append(i)
+
+    return matched
+
+
+def benefit_target_subtotal(group_indices, benefit):
+    return sum(
+        product_line_total(products[i])
+        for i in benefit_target_indices(group_indices, benefit)
+    )
 
 
 def group_product_names(group_indices):
@@ -473,22 +791,41 @@ def points_are_immediate_use(benefit):
     return "사용" in text and "적립" not in text
 
 
-def calculate_effect(current_price, starting_price, benefit):
+def calculate_effect(
+    current_price,
+    starting_price,
+    benefit,
+    target_starting_price=None,
+    target_current_price=None,
+):
     discount_type = benefit.get("discount_type", "unknown")
     value = safe_float(benefit.get("value"))
     min_purchase = safe_float(benefit.get("min_purchase"))
     max_discount = safe_float(benefit.get("max_discount"))
 
+    # 브랜드/상품 한정 혜택이면 대상 상품 금액만 계산 기준으로 사용
+    effective_starting = (
+        starting_price
+        if target_starting_price is None
+        else target_starting_price
+    )
+    effective_current = (
+        current_price
+        if target_current_price is None
+        else target_current_price
+    )
+
+    if effective_starting <= 0:
+        return None
+
     basis = benefit.get("min_purchase_basis", "unknown")
 
     if basis == "starting_price":
-        basis_price = starting_price
+        basis_price = effective_starting
     elif basis == "before_benefit":
-        basis_price = current_price
+        basis_price = effective_current
     else:
-        # 기준을 모를 때는 더 보수적으로 현재 금액 기준으로 계산하고
-        # 결과는 '확인 필요'로 표시
-        basis_price = current_price
+        basis_price = effective_current
 
     if basis_price < min_purchase:
         return None
@@ -497,7 +834,7 @@ def calculate_effect(current_price, starting_price, benefit):
     reward_value = 0
 
     if discount_type == "percent":
-        immediate_discount = current_price * (value / 100)
+        immediate_discount = effective_current * (value / 100)
 
     elif discount_type == "fixed":
         immediate_discount = value
@@ -517,7 +854,7 @@ def calculate_effect(current_price, starting_price, benefit):
         elif reward_value > 0:
             reward_value = min(reward_value, max_discount)
 
-    immediate_discount = min(immediate_discount, current_price)
+    immediate_discount = min(immediate_discount, effective_current, current_price)
 
     if immediate_discount <= 0 and reward_value <= 0:
         return None
@@ -568,7 +905,7 @@ def candidate_orders(selected_benefits):
     yield coupons + others
 
 
-def apply_benefit_subset(starting_price, selected_benefits):
+def apply_benefit_subset(starting_price, selected_benefits, group_indices):
     if not selected_benefits:
         return {
             "payment_price": round(starting_price),
@@ -586,10 +923,28 @@ def apply_benefit_subset(starting_price, selected_benefits):
         valid = True
 
         for benefit in ordered_benefits:
+            target_starting_price = benefit_target_subtotal(
+                group_indices,
+                benefit,
+            )
+
+            # 이전 할인 적용 뒤 해당 대상 상품군에 남아 있을 것으로 보는 금액.
+            # 전체 결제금액 감소 비율을 대상 금액에도 동일하게 적용하는 MVP 근사치.
+            ratio = (
+                current_price / starting_price
+                if starting_price > 0
+                else 1
+            )
+            target_current_price = round(
+                target_starting_price * ratio
+            )
+
             effect = calculate_effect(
                 current_price,
                 starting_price,
                 benefit,
+                target_starting_price=target_starting_price,
+                target_current_price=target_current_price,
             )
 
             if effect is None:
@@ -609,6 +964,8 @@ def apply_benefit_subset(starting_price, selected_benefits):
                         "category_label",
                         benefit.get("category", "")
                     ),
+                    "eligible_brands": benefit.get("eligible_brands", []) or [],
+                    "eligible_items": benefit.get("eligible_items", []) or [],
                     "before": round(before),
                     "discount": round(immediate_discount),
                     "reward": round(reward_value),
@@ -683,7 +1040,11 @@ def calculate_group_plans(group_indices):
         if compatibility == "uncertain" and selected:
             reasons.append("선택한 혜택들의 중복 적용 가능 여부를 확인해주세요.")
 
-        applied = apply_benefit_subset(starting_price, selected)
+        applied = apply_benefit_subset(
+            starting_price,
+            selected,
+            group_indices,
+        )
 
         if applied is None:
             continue
@@ -1039,6 +1400,87 @@ else:
 
 
 # =========================================================
+# 실제 조건과 다른 부분 수정
+# =========================================================
+with st.expander("✏️ 실제 조건과 다른 부분 수정"):
+    st.caption(
+        "추천 결과에서 AI가 놓친 쿠폰·결제 조건이 있다면 알려주세요. "
+        "조건을 반영한 뒤 최적 결제 방법을 바로 다시 계산합니다."
+    )
+
+    correction_note = st.text_area(
+        "수정할 실제 조건",
+        placeholder=(
+            "예) 9천원 쿠폰은 닥터지 제품에만 적용 가능해\n"
+            "예) 이 쿠폰은 네이버페이 혜택과 중복이 안 돼"
+        ),
+        key="page2_condition_correction",
+        label_visibility="collapsed",
+    )
+
+    if st.button(
+        "🔄 조건 반영 후 다시 계산",
+        key="apply_page2_condition",
+    ):
+        if not correction_note.strip():
+            st.warning("실제 조건을 입력해주세요.")
+        else:
+            with st.spinner("조건을 이해하고 다시 계산하고 있습니다..."):
+                try:
+                    result = interpret_condition_on_result(
+                        correction_note,
+                        st.session_state.get("benefits", []),
+                        st.session_state.get("products", []),
+                    )
+
+                    updated_benefits = apply_condition_to_saved_benefits(
+                        st.session_state.get("benefits", []),
+                        result,
+                    )
+
+                    st.session_state["benefits"] = updated_benefits
+                    st.session_state["benefit_relations"] = (
+                        relation_updates_to_map(
+                            result.get("relation_updates", []),
+                            updated_benefits,
+                        )
+                    )
+
+                    notes = st.session_state.get(
+                        "user_condition_history",
+                        [],
+                    )
+                    notes.append({
+                        "text": correction_note.strip(),
+                        "summary": result.get("summary", ""),
+                    })
+                    st.session_state[
+                        "user_condition_history"
+                    ] = notes
+
+                    st.session_state[
+                        "last_page2_condition_summary"
+                    ] = result.get(
+                        "summary",
+                        "조건을 반영했습니다.",
+                    )
+
+                    st.rerun()
+
+                except Exception as error:
+                    st.error("조건을 반영하지 못했습니다.")
+                    with st.expander("오류 상세 보기"):
+                        st.code(str(error))
+
+if st.session_state.get("last_page2_condition_summary"):
+    st.success(
+        "✅ " + st.session_state[
+            "last_page2_condition_summary"
+        ]
+    )
+
+
+# =========================================================
 # 2. 실제 결제 방법 — 분할결제 포함
 # =========================================================
 st.subheader("💳 이렇게 결제하세요")
@@ -1076,8 +1518,14 @@ for payment_no, choice in enumerate(best_option["choices"], start=1):
         if plan["steps"]:
             for step in plan["steps"]:
                 if step["discount"] > 0:
+                    target_label = ""
+                    if step.get("eligible_brands"):
+                        target_label = f" ({', '.join(step['eligible_brands'])} 대상)"
+                    elif step.get("eligible_items"):
+                        target_label = " (특정 상품 대상)"
+
                     st.write(
-                        f"→ **{step['name']}** · {money(step['discount'])} 할인"
+                        f"→ **{step['name']}**{target_label} · {money(step['discount'])} 할인"
                     )
                 elif step["reward"] > 0:
                     st.write(
