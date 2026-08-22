@@ -741,8 +741,20 @@ def option_signature(option):
                 used_ids.append(benefit_id)
 
     return (
+        round(option["payment_price"]),
+        round(option["reward_value"]),
         round(option["effective_cost"]),
         tuple(sorted(used_ids)),
+        len(option["choices"]),
+    )
+
+
+def visible_result_signature(option):
+    """사용자 화면에서 사실상 같은 추천안은 하나만 남긴다."""
+    return (
+        round(option["payment_price"]),
+        round(option["reward_value"]),
+        round(total_original_price - option["effective_cost"]),
         len(option["choices"]),
     )
 
@@ -892,7 +904,8 @@ except Exception as error:
 # =========================================================
 def global_unique_options(candidates, k=5):
     results = []
-    seen = set()
+    seen_logic = set()
+    seen_visible = set()
 
     for option in sorted(
         candidates,
@@ -903,12 +916,19 @@ def global_unique_options(candidates, k=5):
             x["payment_price"],
         ),
     ):
-        sig = option_signature(option)
+        logic_sig = option_signature(option)
+        visible_sig = (
+            round(option["payment_price"]),
+            round(option["reward_value"]),
+            round(total_original_price - option["effective_cost"]),
+            len(option["choices"]),
+        )
 
-        if sig in seen:
+        if logic_sig in seen_logic or visible_sig in seen_visible:
             continue
 
-        seen.add(sig)
+        seen_logic.add(logic_sig)
+        seen_visible.add(visible_sig)
         results.append(option)
 
         if len(results) >= k:
@@ -1003,37 +1023,53 @@ else:
 
 
 # =========================================================
-# 2. 실제 결제 방법 — 짧고 따라 하기 쉽게
+# 2. 실제 결제 방법 — 핵심만
 # =========================================================
 st.subheader("💳 이렇게 결제하세요")
-st.write(f"**{payment_style_text(best_option)}**")
 
 for payment_no, choice in enumerate(best_option["choices"], start=1):
     plan = choice["plan"]
     names = group_product_names(choice["group"])
 
     with st.container(border=True):
-        # 상품이 많을 땐 이름을 길게 헤더로 쓰지 않음
-        if len(names) == 1:
-            st.markdown(f"**결제 {payment_no}. {names[0]}**")
+        if len(best_option["choices"]) == 1:
+            st.markdown(
+                f"### 한 번에 {money(plan['starting_price'])} 결제"
+            )
         else:
-            st.markdown(f"**결제 {payment_no}. 상품 {len(names)}개 함께 결제**")
+            st.markdown(
+                f"### 결제 {payment_no}. {money(plan['starting_price'])}"
+            )
+
+        if len(names) <= 2:
             st.caption(" · ".join(names))
+        else:
+            st.caption(f"선택한 상품 {len(names)}개 함께 결제")
 
         if plan["steps"]:
+            benefit_lines = []
+
             for step in plan["steps"]:
                 if step["discount"] > 0:
-                    st.write(f"→ **{step['name']}** · {money(step['discount'])} 할인")
+                    benefit_lines.append(
+                        f"**{step['name']}** → {money(step['discount'])} 할인"
+                    )
                 elif step["reward"] > 0:
-                    st.write(f"→ **{step['name']}** · {step['reward']:,.0f}P 적립")
+                    benefit_lines.append(
+                        f"**{step['name']}** → {step['reward']:,.0f}P 적립"
+                    )
+
+            for line in benefit_lines:
+                st.write(f"→ {line}")
         else:
             st.write("→ 적용 혜택 없음")
 
-        payment_line = f"**실제 결제 {money(plan['payment_price'])}**"
-        if plan["reward_value"] > 0:
-            payment_line += f" · 결제 후 **{plan['reward_value']:,.0f}P 적립 예상**"
+        result_text = f"**최종 결제 {money(plan['payment_price'])}**"
 
-        st.markdown(payment_line)
+        if plan["reward_value"] > 0:
+            result_text += f" · **{plan['reward_value']:,.0f}P 적립 예상**"
+
+        st.markdown(result_text)
 
 
 # =========================================================
@@ -1091,33 +1127,43 @@ if pair_questions:
 if best_option["uncertain_count"] > 0:
     reasons = unique_text(best_option["uncertain_reasons"])
 
-    st.warning("⚠️ 결제 전에 아래 조건만 확인해주세요.")
+    st.warning("⚠️ 결제 전 확인이 필요한 조건이 있습니다.")
 
-    for reason in reasons[:3]:
+    for reason in reasons[:2]:
         st.write(f"- {reason}")
 
-    if len(reasons) > 3:
-        with st.expander(f"추가 확인사항 {len(reasons) - 3}개"):
-            for reason in reasons[3:]:
+    if len(reasons) > 2:
+        with st.expander(f"추가 확인사항 {len(reasons) - 2}개"):
+            for reason in reasons[2:]:
                 st.write(f"- {reason}")
 else:
     st.success("✅ 현재 입력 정보 기준으로 바로 적용 가능한 결제안입니다.")
 
 
 # =========================================================
-# 4. 다른 방법 — 한 곳에 접어서 표시
+# 5. 다른 방법 — 필요할 때만
 # =========================================================
 confirmed_alternative = None
+
 for option in ranked_confirmed:
-    if option_signature(option) != option_signature(best_option):
+    if visible_result_signature(option) != visible_result_signature(best_option):
         confirmed_alternative = option
         break
 
-alternatives = [
-    option
-    for option in ranked_options[1:]
-    if option_signature(option) != option_signature(best_option)
-][:2]
+alternatives = []
+seen_alt = {visible_result_signature(best_option)}
+
+for option in ranked_options[1:]:
+    sig = visible_result_signature(option)
+
+    if sig in seen_alt:
+        continue
+
+    seen_alt.add(sig)
+    alternatives.append(option)
+
+    if len(alternatives) >= 2:
+        break
 
 if confirmed_alternative is not None or alternatives:
     with st.expander("🔄 다른 결제 방법 보기"):
@@ -1125,19 +1171,33 @@ if confirmed_alternative is not None or alternatives:
             best_option["uncertain_count"] > 0
             and confirmed_alternative is not None
         ):
-            st.markdown("**조건 확인 없이 선택할 수 있는 대안**")
+            alt_immediate = total_immediate_saving(confirmed_alternative)
+            alt_reward = round(confirmed_alternative["reward_value"])
+
+            st.markdown("**🛡️ 조건 확인 없이 선택 가능한 대안**")
             st.write(
-                f"{payment_style_text(confirmed_alternative)} · "
-                f"결제 **{money(confirmed_alternative['payment_price'])}** · "
-                f"총 혜택 **{money(total_benefit_value(confirmed_alternative))}**"
+                f"실제 결제 **{money(confirmed_alternative['payment_price'])}** · "
+                f"즉시 할인 **{money(alt_immediate)}**"
+                + (
+                    f" · 적립 **{alt_reward:,.0f}P**"
+                    if alt_reward > 0 else ""
+                )
             )
             st.divider()
 
-        for rank, option in enumerate(alternatives, start=2):
+        for idx, option in enumerate(alternatives, start=1):
+            alt_immediate = total_immediate_saving(option)
+            alt_reward = round(option["reward_value"])
+
+            st.markdown(f"**대안 {idx}**")
             st.write(
-                f"**{rank}순위** · {payment_style_text(option)} · "
-                f"결제 **{money(option['payment_price'])}** · "
-                f"총 혜택 **{money(total_benefit_value(option))}**"
+                f"{payment_style_text(option)} · "
+                f"실제 결제 **{money(option['payment_price'])}** · "
+                f"즉시 할인 **{money(alt_immediate)}**"
+                + (
+                    f" · 적립 **{alt_reward:,.0f}P**"
+                    if alt_reward > 0 else ""
+                )
             )
 
 
@@ -1154,7 +1214,10 @@ with st.expander("🧮 계산 근거 보기"):
     st.write(f"- 즉시 할인: **{money(immediate_saving)}**")
     if reward_value > 0:
         st.write(f"- 적립 예상: **{reward_value:,.0f}P**")
-    st.write(f"- 총 혜택 가치: **{money(total_benefit)} ({percent(benefit_rate)})**")
+    st.write(
+        f"- 총 혜택 가치(즉시 할인 + 적립): "
+        f"**{money(total_benefit)} ({percent(benefit_rate)})**"
+    )
 
 
 # =========================================================
