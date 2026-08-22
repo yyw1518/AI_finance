@@ -1039,9 +1039,20 @@ else:
 
 
 # =========================================================
-# 2. 실제 결제 방법 — 핵심만
+# 2. 실제 결제 방법 — 분할결제 포함
 # =========================================================
 st.subheader("💳 이렇게 결제하세요")
+
+if len(best_option["choices"]) == 1:
+    st.write("**추천 방식: 한 번에 결제**")
+else:
+    st.write(
+        f"**추천 방식: {len(best_option['choices'])}회 분할 결제**"
+    )
+    st.caption(
+        "상품을 나누어 결제했을 때 쿠폰·결제혜택 조건을 더 유리하게 활용할 수 있어 "
+        "분할 결제가 최적안으로 선택되었습니다."
+    )
 
 for payment_no, choice in enumerate(best_option["choices"], start=1):
     plan = choice["plan"]
@@ -1054,38 +1065,43 @@ for payment_no, choice in enumerate(best_option["choices"], start=1):
             )
         else:
             st.markdown(
-                f"### 결제 {payment_no}. {money(plan['starting_price'])}"
+                f"### 결제 {payment_no} · {money(plan['starting_price'])}"
             )
 
         if len(names) <= 2:
             st.caption(" · ".join(names))
         else:
-            st.caption(f"선택한 상품 {len(names)}개 함께 결제")
+            st.caption(" · ".join(names[:2]) + f" 외 {len(names) - 2}개")
 
         if plan["steps"]:
-            benefit_lines = []
-
             for step in plan["steps"]:
                 if step["discount"] > 0:
-                    benefit_lines.append(
-                        f"**{step['name']}** → {money(step['discount'])} 할인"
+                    st.write(
+                        f"→ **{step['name']}** · {money(step['discount'])} 할인"
                     )
                 elif step["reward"] > 0:
-                    benefit_lines.append(
-                        f"**{step['name']}** → {step['reward']:,.0f}P 적립"
+                    st.write(
+                        f"→ **{step['name']}** · {step['reward']:,.0f}P 적립"
                     )
-
-            for line in benefit_lines:
-                st.write(f"→ {line}")
         else:
             st.write("→ 적용 혜택 없음")
 
-        result_text = f"**최종 결제 {money(plan['payment_price'])}**"
+        result_text = f"**실제 결제 {money(plan['payment_price'])}**"
 
         if plan["reward_value"] > 0:
             result_text += f" · **{plan['reward_value']:,.0f}P 적립 예상**"
 
         st.markdown(result_text)
+
+# 분할 결제인 경우 전체 합계를 한 번 더 짧게 보여줌
+if len(best_option["choices"]) > 1:
+    st.info(
+        f"분할 결제 합계 **{money(final_payment)}**"
+        + (
+            f" · 총 적립 예상 **{reward_value:,.0f}P**"
+            if reward_value > 0 else ""
+        )
+    )
 
 
 # =========================================================
@@ -1205,7 +1221,7 @@ if confirmed_alternative is not None or alternatives:
 
             st.markdown(f"**대안 {idx}**")
             st.write(
-                f"{payment_style_text(option)} · "
+                f"**{payment_style_text(option)}** · "
                 f"실제 결제 **{money(option['payment_price'])}** · "
                 f"즉시 할인 **{money(alt_immediate)}**"
                 + (
@@ -1258,6 +1274,11 @@ with st.expander("🧮 계산 근거 보기"):
         f"- 총 혜택 가치(즉시 할인 + 적립): "
         f"**{money(total_benefit)} ({percent(benefit_rate)})**"
     )
+
+    if allow_split_payment and len(products) > 1:
+        st.write(
+            f"- 결제 방식 비교: **한 번 결제 + 분할 결제 조합 비교 완료**"
+        )
 
 
 # =========================================================
