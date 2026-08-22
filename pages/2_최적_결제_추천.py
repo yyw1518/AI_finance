@@ -60,19 +60,8 @@ if not benefits:
 # =========================================================
 # MVP 계산 한도
 # =========================================================
-MAX_BENEFITS = 8
+MAX_EXHAUSTIVE_BENEFITS = 12
 MAX_EXHAUSTIVE_PRODUCTS = 5
-
-
-if len(benefits) > MAX_BENEFITS:
-
-    st.error(
-        f"현재 MVP는 혜택 **{MAX_BENEFITS}개까지** "
-        "전수 비교하도록 설정되어 있습니다. "
-        "1번 페이지에서 가장 관련 있는 혜택만 남겨주세요."
-    )
-
-    st.stop()
 
 
 # =========================================================
@@ -147,6 +136,23 @@ def safe_float(
     ):
 
         return default
+
+
+def benefit_priority_score(benefit):
+    value = safe_float(benefit.get("value", 0))
+    discount_type = benefit.get("discount_type", "unknown")
+    confidence = benefit.get("confidence", "low")
+
+    score = value
+    if discount_type == "percent":
+        score *= 1000
+    if confidence == "high":
+        score += 100000
+    elif confidence == "medium":
+        score += 50000
+    if benefit.get("value_known", False):
+        score += 20000
+    return score
 
 
 def normalize_category(
@@ -1122,9 +1128,22 @@ def apply_benefit_subset(
 # =========================================================
 # 결제 그룹별 가능한 혜택
 # =========================================================
-benefit_count = len(
-    benefits
-)
+original_benefit_count = len(benefits)
+
+if original_benefit_count > MAX_EXHAUSTIVE_BENEFITS:
+    benefits = sorted(
+        benefits,
+        key=benefit_priority_score,
+        reverse=True,
+    )[:MAX_EXHAUSTIVE_BENEFITS]
+
+    st.warning(
+        f"혜택이 {original_benefit_count}개라 계산량이 매우 커질 수 있어 "
+        f"조건이 명확하고 혜택값이 큰 {MAX_EXHAUSTIVE_BENEFITS}개를 우선 비교합니다. "
+        "불필요한 혜택을 1번 페이지에서 삭제하면 더 정확히 비교할 수 있습니다."
+    )
+
+benefit_count = len(benefits)
 
 
 def calculate_group_plans(
@@ -2033,29 +2052,15 @@ if top_confirmed:
         )
 
 
-    summary_df = pd.DataFrame(
-        summary_rows
-    )
-
+    summary_df = pd.DataFrame(summary_rows)
+    summary_display_df = summary_df.copy()
+    summary_display_df["예상 최종금액"] = summary_display_df["예상 최종금액"].apply(money)
+    summary_display_df["총 절약금액"] = summary_display_df["총 절약금액"].apply(money)
 
     st.dataframe(
-        summary_df,
+        summary_display_df,
         hide_index=True,
         width="stretch",
-
-        column_config={
-            "예상 최종금액":
-                st.column_config.NumberColumn(
-                    "예상 최종금액",
-                    format="%d원",
-                ),
-
-            "총 절약금액":
-                st.column_config.NumberColumn(
-                    "총 절약금액",
-                    format="%d원",
-                ),
-        },
     )
 
 
