@@ -509,6 +509,8 @@ if st.button(
                 st.session_state["gemini_products"] = result.get("products", [])
                 st.session_state["gemini_benefits"] = result.get("benefits", [])
                 st.session_state["gemini_warnings"] = result.get("warnings", [])
+                st.session_state["benefit_working_df"] = ai_benefits_to_df(result.get("benefits", []))
+                st.session_state["product_working_df"] = ai_products_to_df(result.get("products", []))
 
                 detected_store = result.get("store_name", "").strip()
                 if detected_store:
@@ -566,7 +568,9 @@ if "gemini_analysis_result" in st.session_state:
     # ---------------- 상품 ----------------
     st.subheader("🛍️ 상품")
 
-    product_df = ai_products_to_df(st.session_state.get("gemini_products", []))
+    if "product_working_df" not in st.session_state:
+        st.session_state["product_working_df"] = ai_products_to_df(st.session_state.get("gemini_products", []))
+    product_df = st.session_state["product_working_df"].copy()
 
     edited_products = st.data_editor(
         product_df,
@@ -580,7 +584,7 @@ if "gemini_analysis_result" in st.session_state:
                 "가격",
                 min_value=0,
                 step=1000,
-                format="%d원",
+                format="localized",
             ),
             "수량": st.column_config.NumberColumn(
                 "수량",
@@ -609,7 +613,13 @@ if "gemini_analysis_result" in st.session_state:
     # ---------------- 혜택 ----------------
     st.subheader("🎟️ 혜택")
 
-    benefit_df = ai_benefits_to_df(st.session_state.get("gemini_benefits", []))
+    if "benefit_working_df" not in st.session_state:
+        st.session_state["benefit_working_df"] = ai_benefits_to_df(st.session_state.get("gemini_benefits", []))
+
+    benefit_df = st.session_state["benefit_working_df"].copy()
+
+    if "삭제" not in benefit_df.columns:
+        benefit_df.insert(0, "삭제", False)
 
     edited_benefits = st.data_editor(
         benefit_df,
@@ -617,54 +627,40 @@ if "gemini_analysis_result" in st.session_state:
         hide_index=True,
         width="stretch",
         key="gemini_benefit_editor",
+        column_order=[
+            "삭제", "혜택명", "분류", "제공사", "할인방식", "할인값",
+            "최소결제금액", "최대할인금액", "사용채널", "유효기간"
+        ],
         column_config={
-            "분류": st.column_config.SelectboxColumn(
-                "분류",
-                options=list(CATEGORY_TO_KR.values()),
-            ),
-            "할인방식": st.column_config.SelectboxColumn(
-                "할인방식",
-                options=list(DISCOUNT_TO_KR.values()),
-            ),
-            "할인값": st.column_config.NumberColumn("할인값", min_value=0),
-            "할인값확인": st.column_config.SelectboxColumn(
-                "할인값확인", options=["확인", "확인 필요"]
-            ),
-            "최소결제금액": st.column_config.NumberColumn(
-                "최소결제금액", min_value=0, step=1000, format="%d원"
-            ),
-            "최소금액확인": st.column_config.SelectboxColumn(
-                "최소금액확인", options=["확인", "확인 필요"]
-            ),
-            "최대할인금액": st.column_config.NumberColumn(
-                "최대할인금액", min_value=0, step=1000, format="%d원"
-            ),
-            "최대할인확인": st.column_config.SelectboxColumn(
-                "최대할인확인", options=["확인", "확인 필요"]
-            ),
-            "쿠폰중복": st.column_config.SelectboxColumn(
-                "쿠폰중복", options=list(STACK_TO_KR.values())
-            ),
-            "멤버십중복": st.column_config.SelectboxColumn(
-                "멤버십중복", options=list(STACK_TO_KR.values())
-            ),
-            "카드/결제중복": st.column_config.SelectboxColumn(
-                "카드/결제중복", options=list(STACK_TO_KR.values())
-            ),
-            "사용채널": st.column_config.SelectboxColumn(
-                "사용채널", options=list(CHANNEL_TO_KR.values())
-            ),
-            "분할결제재사용": st.column_config.SelectboxColumn(
-                "분할결제재사용", options=list(REUSE_TO_KR.values())
-            ),
-            "최소금액기준": st.column_config.SelectboxColumn(
-                "최소금액기준", options=list(BASIS_TO_KR.values())
-            ),
-            "AI확신도": st.column_config.SelectboxColumn(
-                "AI확신도", options=["high", "medium", "low"]
-            ),
+            "삭제": st.column_config.CheckboxColumn("삭제", default=False),
+            "혜택명": st.column_config.TextColumn("혜택명"),
+            "분류": st.column_config.SelectboxColumn("분류", options=list(CATEGORY_TO_KR.values())),
+            "제공사": st.column_config.TextColumn("제공사"),
+            "할인방식": st.column_config.SelectboxColumn("할인방식", options=list(DISCOUNT_TO_KR.values())),
+            "할인값": st.column_config.NumberColumn("할인값", min_value=0, format="localized"),
+            "최소결제금액": st.column_config.NumberColumn("최소결제금액", min_value=0, step=1000, format="localized"),
+            "최대할인금액": st.column_config.NumberColumn("최대할인금액", min_value=0, step=1000, format="localized"),
+            "사용채널": st.column_config.SelectboxColumn("사용채널", options=list(CHANNEL_TO_KR.values())),
+            "유효기간": st.column_config.TextColumn("유효기간"),
         },
     )
+
+    if st.button("🗑️ 선택한 혜택 삭제"):
+        delete_mask = edited_benefits["삭제"].fillna(False).astype(bool)
+        remaining = edited_benefits.loc[~delete_mask].copy()
+        remaining = remaining.drop(columns=["삭제"], errors="ignore").reset_index(drop=True)
+        st.session_state["benefit_working_df"] = remaining
+        st.session_state.pop("gemini_benefit_editor", None)
+        st.rerun()
+
+    st.caption(
+        "기본 표에는 소비자가 확인할 핵심 정보만 표시합니다. "
+        "중복 여부·필수 결제수단·제외대상·기타 조건은 계산용 데이터로 그대로 보존됩니다."
+    )
+
+    edited_benefits = edited_benefits.loc[
+        ~edited_benefits["삭제"].fillna(False).astype(bool)
+    ].drop(columns=["삭제"], errors="ignore")
 
     st.caption(
         "'확인 필요'는 AI가 사진에서 해당 조건을 확인하지 못했다는 뜻입니다. "
@@ -682,6 +678,9 @@ if "gemini_analysis_result" in st.session_state:
         "상품을 나누어 결제하는 경우까지 비교",
         value=st.session_state.get("allow_split_payment", True),
     )
+
+    st.session_state["product_working_df"] = edited_products.copy()
+    st.session_state["benefit_working_df"] = edited_benefits.copy()
 
     if st.button(
         "💾 확인한 정보 저장",
