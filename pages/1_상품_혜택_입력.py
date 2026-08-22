@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 
 import pandas as pd
 import streamlit as st
@@ -61,11 +62,12 @@ EXTRACTION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
+                    "brand": {"type": "string"},
                     "price": {"type": "number"},
                     "quantity": {"type": "integer"},
                     "price_known": {"type": "boolean"},
                 },
-                "required": ["name", "price", "quantity", "price_known"],
+                "required": ["name", "brand", "price", "quantity", "price_known"],
                 "additionalProperties": False,
             },
         },
@@ -124,6 +126,16 @@ EXTRACTION_SCHEMA = {
                         "enum": ["starting_price", "before_benefit", "unknown"],
                     },
                     "required_payment_method": {"type": "string"},
+                    "eligible_brands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "이 혜택이 적용되는 브랜드 목록. 전체 적용이면 빈 배열.",
+                    },
+                    "eligible_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "특정 상품/상품군에만 적용되는 경우 대상명. 전체 적용이면 빈 배열.",
+                    },
                     "excluded_items": {"type": "string"},
                     "exclusive_group": {"type": "string"},
                     "exclusive_group_reason": {"type": "string"},
@@ -153,6 +165,8 @@ EXTRACTION_SCHEMA = {
                     "reuse_type",
                     "min_purchase_basis",
                     "required_payment_method",
+                    "eligible_brands",
+                    "eligible_items",
                     "excluded_items",
                     "exclusive_group",
                     "exclusive_group_reason",
@@ -204,6 +218,111 @@ EXTRACTION_SCHEMA = {
 
 
 # =========================================================
+# 사용자 추가 조건 해석
+# =========================================================
+
+USER_CONDITION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "benefit_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target_benefit_name": {"type": "string"},
+                    "eligible_brands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "eligible_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "excluded_items": {"type": "string"},
+                    "required_payment_method": {"type": "string"},
+                    "stack_coupon": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                    "stack_membership": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                    "stack_payment": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible", "unknown", "no_change"],
+                    },
+                },
+                "required": [
+                    "target_benefit_name",
+                    "eligible_brands",
+                    "eligible_items",
+                    "excluded_items",
+                    "required_payment_method",
+                    "stack_coupon",
+                    "stack_membership",
+                    "stack_payment",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "relation_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "benefit_a_name": {"type": "string"},
+                    "benefit_b_name": {"type": "string"},
+                    "relation": {
+                        "type": "string",
+                        "enum": ["possible", "not_possible"],
+                    },
+                },
+                "required": [
+                    "benefit_a_name",
+                    "benefit_b_name",
+                    "relation",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["benefit_updates", "relation_updates", "summary"],
+    "additionalProperties": False,
+}
+
+
+def user_condition_prompt(note, benefit_names, products_context):
+    return f"""
+너는 쇼핑 혜택 조건을 구조화하는 분석기다.
+
+사용자가 이미 AI가 분석한 혜택에 대해 추가 조건을 자연어로 알려준다.
+사용자의 말은 AI 분석보다 우선하는 확정 정보로 취급한다.
+
+[현재 혜택명]
+{json.dumps(benefit_names, ensure_ascii=False)}
+
+[현재 상품/브랜드]
+{json.dumps(products_context, ensure_ascii=False)}
+
+[사용자 추가 조건]
+{note}
+
+규칙:
+- target_benefit_name은 반드시 현재 혜택명 중 가장 알맞은 이름을 그대로 사용한다.
+- "이 쿠폰은 라운드랩에만 적용돼"라면 해당 쿠폰의 eligible_brands=["라운드랩"].
+- "A 쿠폰은 B 상품에만 적용돼"라면 eligible_items에 B를 넣는다.
+- "A 쿠폰은 다른 쿠폰과 중복 안 돼"라면 stack_coupon="not_possible".
+- "A 쿠폰은 카드 할인과 중복돼"라면 stack_payment="possible".
+- "A 혜택과 B 혜택은 같이 못 써"라면 relation_updates에 두 혜택 관계를 not_possible로 넣는다.
+- 사용자가 말하지 않은 속성은 빈 배열/빈 문자열/no_change로 둔다.
+- 사용자가 어떤 혜택을 가리키는지 합리적으로 특정할 수 없으면 benefit_updates에 억지로 넣지 말고 summary에서 다시 확인이 필요하다고 안내한다.
+- summary는 사용자에게 직접 보여줄 짧은 존댓말 문장으로 작성한다.
+"""
+
+
+# =========================================================
 # 이미지 분석 프롬프트
 # =========================================================
 ANALYSIS_PROMPT = """
@@ -222,9 +341,22 @@ ANALYSIS_PROMPT = """
 - "~함", "~기재함", "~확인됨" 같은 보고서체는 사용하지 않는다.
 
 [상품]
-- 장바구니, 상품 상세, 주문 화면에 상품명·가격·수량이 보이면 products에 넣는다.
+- 장바구니, 상품 상세, 주문 화면에 상품명·브랜드·가격·수량이 보이면 products에 넣는다.
+- 상품명 앞/위에 브랜드명이 따로 보이면 brand에 분리해서 적는다.
+- 브랜드를 확실히 알 수 없으면 brand는 빈 문자열로 둔다.
 - 가격을 확실히 못 읽으면 price=0, price_known=false.
 - 상품 화면이 없으면 products는 빈 배열이어도 된다.
+
+
+[브랜드/상품 한정 혜택 - 매우 중요]
+- "OOO 브랜드 20% 쿠폰", "라운드랩 전용", "일부 브랜드 전용", "특정 브랜드 상품에만 적용"처럼
+  적용 대상이 제한된 혜택은 반드시 eligible_brands에 대상 브랜드를 넣는다.
+- 특정 상품명/상품군에만 적용되면 eligible_items에 넣는다.
+- "전 상품", "전체 상품"처럼 전체 적용이면 eligible_brands와 eligible_items는 빈 배열로 둔다.
+- 적용 대상이 브랜드인지 상품인지 애매하면 사진 문구를 raw_conditions에도 남긴다.
+- 브랜드별 쿠폰은 해당 브랜드 상품 금액에만 할인율/최소금액/최대할인을 계산해야 한다.
+- 예: 장바구니에 A브랜드 40,000원 + B브랜드 30,000원이 있고 A브랜드 전용 20% 쿠폰이라면
+  쿠폰 계산 기준 금액은 전체 70,000원이 아니라 A브랜드 대상 상품 금액 40,000원이다.
 
 [혜택 분류]
 - 쇼핑몰/브랜드 쿠폰: coupon
@@ -373,6 +505,118 @@ def analyze_images(uploaded_files):
     return json.loads(interaction.output_text)
 
 
+
+def interpret_user_condition(note, benefit_df, product_df):
+    client = get_gemini_client()
+
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY가 없습니다.")
+
+    benefit_names = [
+        str(name).strip()
+        for name in benefit_df.get("혜택명", []).tolist()
+        if str(name).strip()
+    ]
+
+    products_context = []
+    for _, row in product_df.iterrows():
+        products_context.append({
+            "name": str(row.get("상품명", "")).strip(),
+            "brand": str(row.get("브랜드", "")).strip(),
+        })
+
+    interaction = client.interactions.create(
+        model=MODEL_NAME,
+        input=[
+            {
+                "type": "text",
+                "text": user_condition_prompt(
+                    note,
+                    benefit_names,
+                    products_context,
+                ),
+            }
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": USER_CONDITION_SCHEMA,
+        },
+        store=False,
+    )
+
+    return json.loads(interaction.output_text)
+
+
+def stack_code_to_label(value):
+    return {
+        "possible": "가능",
+        "not_possible": "불가",
+        "unknown": "확인 필요",
+    }.get(value)
+
+
+def apply_condition_to_editor_df(benefit_df, result):
+    updated = benefit_df.copy()
+
+    for update in result.get("benefit_updates", []):
+        target = str(update.get("target_benefit_name", "")).strip()
+        if not target:
+            continue
+
+        matches = updated.index[
+            updated["혜택명"].astype(str).str.strip() == target
+        ].tolist()
+
+        # exact match 실패 시 부분 일치 1개일 때만
+        if not matches:
+            partial = updated.index[
+                updated["혜택명"].astype(str).str.contains(
+                    re.escape(target),
+                    case=False,
+                    na=False,
+                )
+            ].tolist()
+            if len(partial) == 1:
+                matches = partial
+
+        if len(matches) != 1:
+            continue
+
+        idx = matches[0]
+
+        brands = update.get("eligible_brands", []) or []
+        items = update.get("eligible_items", []) or []
+        excluded = str(update.get("excluded_items", "")).strip()
+        required_payment = str(
+            update.get("required_payment_method", "")
+        ).strip()
+
+        if brands:
+            updated.at[idx, "적용브랜드"] = ", ".join(brands)
+
+        if "적용상품" in updated.columns and items:
+            updated.at[idx, "적용상품"] = ", ".join(items)
+
+        if excluded:
+            updated.at[idx, "제외대상"] = excluded
+
+        if required_payment:
+            updated.at[idx, "필수결제수단"] = required_payment
+
+        for source_key, column_name in [
+            ("stack_coupon", "쿠폰중복"),
+            ("stack_membership", "멤버십중복"),
+            ("stack_payment", "카드/결제중복"),
+        ]:
+            value = update.get(source_key, "no_change")
+            label = stack_code_to_label(value)
+            if label is not None:
+                updated.at[idx, column_name] = label
+
+    return updated
+
+
 # =========================================================
 # 표시 변환 함수
 # =========================================================
@@ -430,6 +674,7 @@ def ai_products_to_df(products):
         rows.append(
             {
                 "상품명": product.get("name", ""),
+                "브랜드": product.get("brand", ""),
                 "가격": product.get("price", 0),
                 "수량": product.get("quantity", 1),
                 "가격확인": "확인" if product.get("price_known", False) else "확인 필요",
@@ -437,7 +682,7 @@ def ai_products_to_df(products):
         )
 
     if not rows:
-        rows = [{"상품명": "", "가격": 0, "수량": 1, "가격확인": "확인 필요"}]
+        rows = [{"상품명": "", "브랜드": "", "가격": 0, "수량": 1, "가격확인": "확인 필요"}]
 
     return pd.DataFrame(rows)
 
@@ -470,6 +715,8 @@ def ai_benefits_to_df(benefits):
                 "분할결제재사용": REUSE_TO_KR.get(benefit.get("reuse_type"), "확인 필요"),
                 "최소금액기준": BASIS_TO_KR.get(benefit.get("min_purchase_basis"), "확인 필요"),
                 "필수결제수단": benefit.get("required_payment_method", ""),
+                "적용브랜드": ", ".join(benefit.get("eligible_brands", []) or []),
+                "적용상품": ", ".join(benefit.get("eligible_items", []) or []),
                 "제외대상": benefit.get("excluded_items", ""),
                 "택일그룹": benefit.get("exclusive_group", ""),
                 "택일그룹근거": benefit.get("exclusive_group_reason", ""),
@@ -500,6 +747,8 @@ def ai_benefits_to_df(benefits):
                 "분할결제재사용": "확인 필요",
                 "최소금액기준": "확인 필요",
                 "필수결제수단": "",
+                "적용브랜드": "",
+                "적용상품": "",
                 "제외대상": "",
                 "택일그룹": "",
                 "택일그룹근거": "",
@@ -523,6 +772,23 @@ def clean_text(value):
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def split_list_text(value):
+    text = clean_text(value)
+    if not text:
+        return []
+
+    separators = [",", "/", "|", "·"]
+    parts = [text]
+
+    for sep in separators:
+        new_parts = []
+        for part in parts:
+            new_parts.extend(part.split(sep))
+        parts = new_parts
+
+    return [part.strip() for part in parts if part.strip()]
 
 
 def clean_number(value):
@@ -662,6 +928,10 @@ if "gemini_analysis_result" in st.session_state:
         key="gemini_product_editor",
         column_config={
             "상품명": st.column_config.TextColumn("상품명"),
+            "브랜드": st.column_config.TextColumn(
+                "브랜드",
+                help="브랜드 전용 쿠폰 계산에 사용합니다."
+            ),
             "가격": st.column_config.NumberColumn(
                 "가격",
                 min_value=0,
@@ -710,7 +980,7 @@ if "gemini_analysis_result" in st.session_state:
         width="stretch",
         key="gemini_benefit_editor",
         column_order=[
-            "삭제", "혜택명", "분류", "제공사", "할인방식", "할인값",
+            "삭제", "혜택명", "분류", "제공사", "적용브랜드", "할인방식", "할인값",
             "최소결제금액", "최대할인금액", "사용채널", "유효기간"
         ],
         column_config={
@@ -718,6 +988,10 @@ if "gemini_analysis_result" in st.session_state:
             "혜택명": st.column_config.TextColumn("혜택명"),
             "분류": st.column_config.SelectboxColumn("분류", options=list(CATEGORY_TO_KR.values())),
             "제공사": st.column_config.TextColumn("제공사"),
+            "적용브랜드": st.column_config.TextColumn(
+                "적용브랜드",
+                help="브랜드 전용 혜택이면 대상 브랜드가 표시됩니다. 여러 개면 쉼표로 구분합니다."
+            ),
             "할인방식": st.column_config.SelectboxColumn("할인방식", options=list(DISCOUNT_TO_KR.values())),
             "할인값": st.column_config.NumberColumn("할인값", min_value=0, format="localized"),
             "최소결제금액": st.column_config.NumberColumn("최소결제금액", min_value=0, step=1000, format="localized"),
@@ -743,6 +1017,82 @@ if "gemini_analysis_result" in st.session_state:
     edited_benefits = edited_benefits.loc[
         ~edited_benefits["삭제"].fillna(False).astype(bool)
     ].drop(columns=["삭제"], errors="ignore")
+
+    with st.expander("✏️ AI에게 추가 조건 알려주기"):
+        st.caption(
+            "AI가 놓친 쿠폰 적용 조건을 알고 있다면 평소 말하듯 적어주세요. "
+            "예: '8월 브랜드 쿠폰은 라운드랩 제품에만 적용 가능해.'"
+        )
+
+        user_condition_note = st.text_area(
+            "추가 조건",
+            placeholder=(
+                "예) 9천원 쿠폰은 닥터지 제품에만 적용 가능해\n"
+                "예) 첫구매 쿠폰은 다른 쿠폰이랑 중복 안 돼"
+            ),
+            key="input_user_condition_note",
+            label_visibility="collapsed",
+        )
+
+        if st.button(
+            "✨ 조건을 AI에 반영",
+            key="apply_user_condition_page1",
+        ):
+            if not user_condition_note.strip():
+                st.warning("추가 조건을 입력해주세요.")
+            else:
+                with st.spinner("추가 조건을 이해하고 있습니다..."):
+                    try:
+                        condition_result = interpret_user_condition(
+                            user_condition_note,
+                            edited_benefits,
+                            edited_products,
+                        )
+
+                        updated_df = apply_condition_to_editor_df(
+                            edited_benefits,
+                            condition_result,
+                        )
+
+                        st.session_state["benefit_working_df"] = (
+                            updated_df.copy()
+                        )
+
+                        # 혜택 간 직접 관계도 이름 기준으로 임시 저장
+                        relation_notes = st.session_state.get(
+                            "pending_user_relation_notes",
+                            [],
+                        )
+                        relation_notes.extend(
+                            condition_result.get(
+                                "relation_updates",
+                                [],
+                            )
+                        )
+                        st.session_state[
+                            "pending_user_relation_notes"
+                        ] = relation_notes
+
+                        st.session_state[
+                            "last_user_condition_summary"
+                        ] = condition_result.get(
+                            "summary",
+                            "추가 조건을 반영했습니다.",
+                        )
+
+                        st.session_state.pop(
+                            "gemini_benefit_editor",
+                            None,
+                        )
+                        st.rerun()
+
+                    except Exception as error:
+                        st.error("추가 조건을 반영하지 못했습니다.")
+                        with st.expander("오류 상세 보기"):
+                            st.code(str(error))
+
+    if st.session_state.get("last_user_condition_summary"):
+        st.success(st.session_state["last_user_condition_summary"])
 
     st.caption(
         "'확인 필요'는 AI가 사진에서 해당 조건을 확인하지 못했다는 뜻입니다. "
@@ -786,6 +1136,7 @@ if "gemini_analysis_result" in st.session_state:
                 {
                     "id": f"product_{index}",
                     "name": name,
+                    "brand": clean_text(row.get("브랜드", "")),
                     "price": price,
                     "quantity": quantity,
                     "total": price * quantity,
@@ -860,6 +1211,8 @@ if "gemini_analysis_result" in st.session_state:
                     ),
                     "min_purchase_basis_label": row.get("최소금액기준", "확인 필요"),
                     "required_payment_method": clean_text(row.get("필수결제수단", "")),
+                    "eligible_brands": split_list_text(row.get("적용브랜드", "")),
+                    "eligible_items": split_list_text(row.get("적용상품", "")),
                     "excluded_items": clean_text(row.get("제외대상", "")),
                     "exclusive_group": clean_text(row.get("택일그룹", "")),
                     "exclusive_group_reason": clean_text(row.get("택일그룹근거", "")),
@@ -926,7 +1279,42 @@ if "gemini_analysis_result" in st.session_state:
             st.session_state["ai_benefit_relation_meta"] = ai_relation_meta
 
             # 새 상품/혜택 분석을 저장하면 이전 구매에서 사용자가 답한 관계는 초기화
-            st.session_state["benefit_relations"] = {}
+            # 사용자 자연어로 직접 알려준 혜택 간 관계를 ID 기준으로 변환
+            user_relation_map = {}
+
+            for relation in st.session_state.get(
+                "pending_user_relation_notes",
+                [],
+            ):
+                a_name = clean_text(
+                    relation.get("benefit_a_name", "")
+                )
+                b_name = clean_text(
+                    relation.get("benefit_b_name", "")
+                )
+                relation_value = clean_text(
+                    relation.get("relation", "")
+                )
+
+                if (
+                    a_name in name_to_ids
+                    and b_name in name_to_ids
+                    and len(name_to_ids[a_name]) == 1
+                    and len(name_to_ids[b_name]) == 1
+                    and relation_value in {
+                        "possible",
+                        "not_possible",
+                    }
+                ):
+                    key = "||".join(
+                        sorted([
+                            name_to_ids[a_name][0],
+                            name_to_ids[b_name][0],
+                        ])
+                    )
+                    user_relation_map[key] = relation_value
+
+            st.session_state["benefit_relations"] = user_relation_map
 
             uncertain_count = sum(
                 1
