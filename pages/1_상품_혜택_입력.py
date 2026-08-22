@@ -125,6 +125,8 @@ EXTRACTION_SCHEMA = {
                     },
                     "required_payment_method": {"type": "string"},
                     "excluded_items": {"type": "string"},
+                    "exclusive_group": {"type": "string"},
+                    "exclusive_group_reason": {"type": "string"},
                     "raw_conditions": {"type": "string"},
                     "confidence": {
                         "type": "string",
@@ -152,6 +154,8 @@ EXTRACTION_SCHEMA = {
                     "min_purchase_basis",
                     "required_payment_method",
                     "excluded_items",
+                    "exclusive_group",
+                    "exclusive_group_reason",
                     "raw_conditions",
                     "confidence",
                 ],
@@ -182,10 +186,9 @@ ANALYSIS_PROMPT = """
 - 숫자가 보이지 않으면 해당 known 필드를 false로 하고 숫자값은 0으로 둔다.
 - 같은 혜택의 앞/뒤 조건을 여러 사진으로 올렸다면 명백히 동일한 혜택일 때만 하나로 합친다.
 - 한 사진에 여러 혜택이 있으면 각각 별도 혜택으로 추출한다.
-- 이미지가 잘렸거나 글자가 흐리거나 조건을 확실히 판단하기 어려운 부분은 warnings에 적는다.
-- warnings는 사용자에게 직접 보여주는 안내 문구이므로 반드시 친절한 존댓말로 작성한다.
-- "~함", "~기재함", "~확인됨" 같은 보고서체나 반말은 사용하지 않는다.
-- 예: "일부 이미지에서 상세 조건을 확인하기 어려워, 확인 가능한 혜택을 기준으로 분석했습니다."
+- 이미지가 잘렸거나 글자가 흐리면 warnings에 적는다.
+- warnings는 사용자에게 직접 보여주는 문구이므로 반드시 친절한 존댓말로 작성한다.
+- "~함", "~기재함", "~확인됨" 같은 보고서체는 사용하지 않는다.
 
 [상품]
 - 장바구니, 상품 상세, 주문 화면에 상품명·가격·수량이 보이면 products에 넣는다.
@@ -216,6 +219,10 @@ ANALYSIS_PROMPT = """
 - stack_membership: 멤버십과 중복 가능 여부
 - stack_payment: 카드/간편결제 등 결제혜택과 중복 가능 여부
 - 명시되어 있지 않으면 unknown
+- 동일 이벤트 안에서 결제금액 구간에 따라 3천P/5천P 또는 4천원/6천원/9천원처럼
+  하나만 선택되는 단계형 혜택이라면 각각 별도 혜택으로 추출하되 같은 exclusive_group 값을 부여한다.
+- exclusive_group은 사진 속 이벤트 구조를 근거로 판단하고, 근거가 부족하면 빈 문자열로 둔다.
+- exclusive_group_reason에는 "동일 이벤트의 금액대별 택1 혜택"처럼 짧게 이유를 적는다.
 
 [채널]
 - 온라인 전용: online
@@ -399,6 +406,8 @@ def ai_benefits_to_df(benefits):
                 "최소금액기준": BASIS_TO_KR.get(benefit.get("min_purchase_basis"), "확인 필요"),
                 "필수결제수단": benefit.get("required_payment_method", ""),
                 "제외대상": benefit.get("excluded_items", ""),
+                "택일그룹": benefit.get("exclusive_group", ""),
+                "택일그룹근거": benefit.get("exclusive_group_reason", ""),
                 "기타조건": benefit.get("raw_conditions", ""),
                 "AI확신도": benefit.get("confidence", "low"),
             }
@@ -427,6 +436,8 @@ def ai_benefits_to_df(benefits):
                 "최소금액기준": "확인 필요",
                 "필수결제수단": "",
                 "제외대상": "",
+                "택일그룹": "",
+                "택일그룹근거": "",
                 "기타조건": "",
                 "AI확신도": "low",
             }
@@ -782,6 +793,8 @@ if "gemini_analysis_result" in st.session_state:
                     "min_purchase_basis_label": row.get("최소금액기준", "확인 필요"),
                     "required_payment_method": clean_text(row.get("필수결제수단", "")),
                     "excluded_items": clean_text(row.get("제외대상", "")),
+                    "exclusive_group": clean_text(row.get("택일그룹", "")),
+                    "exclusive_group_reason": clean_text(row.get("택일그룹근거", "")),
                     "conditions": combined_conditions,
                     "confidence": clean_text(row.get("AI확신도", "low")),
                 }
