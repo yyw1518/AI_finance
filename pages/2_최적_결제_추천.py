@@ -266,17 +266,33 @@ def relation_key(a, b):
     return "||".join(ids)
 
 
-def pair_compatibility(a, b):
-    # 사용자가 직접 확인한 정보가 가장 우선
-    user_relations = st.session_state.get("benefit_relations", {})
-    saved = user_relations.get(relation_key(a, b))
+def relation_key(a, b):
+    ids = sorted([str(a.get("id", "")), str(b.get("id", ""))])
+    return "||".join(ids)
 
-    if saved == "possible":
+
+def pair_compatibility(a, b):
+    key = relation_key(a, b)
+
+    # 0) 사용자가 직접 확인한 답이 최우선
+    user_relations = st.session_state.get("benefit_relations", {})
+    user_relation = user_relations.get(key)
+
+    if user_relation == "possible":
         return "confirmed"
-    if saved == "not_possible":
+    if user_relation == "not_possible":
         return "invalid"
 
-    # AI가 같은 택일 그룹으로 판단한 혜택은 함께 사용하지 않음
+    # 1) Gemini가 전체 혜택을 비교해 판단한 관계
+    ai_relations = st.session_state.get("ai_benefit_relations", {})
+    ai_relation = ai_relations.get(key)
+
+    if ai_relation == "possible":
+        return "confirmed"
+    if ai_relation == "not_possible":
+        return "invalid"
+
+    # 2) AI가 같은 택일 그룹으로 묶은 경우
     group_a = str(a.get("exclusive_group", "")).strip()
     group_b = str(b.get("exclusive_group", "")).strip()
 
@@ -1073,53 +1089,51 @@ for payment_no, choice in enumerate(best_option["choices"], start=1):
 
 
 # =========================================================
-# 3. 중복 여부 직접 확인
+# 3. 정말 필요한 경우에만 한 번 확인
 # =========================================================
 pair_questions = []
 seen_pair_keys = set()
 
 for pair in best_option.get("uncertain_pairs", []):
     key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
-
     if key and key not in seen_pair_keys:
         seen_pair_keys.add(key)
         pair_questions.append(pair)
 
+# AI도 판단하지 못했고, 현재 최적안에 실제 포함된 관계만 최대 1개 질문
 if pair_questions:
+    pair = pair_questions[0]
+    key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
+    current_value = st.session_state.get("benefit_relations", {}).get(key)
+
     st.warning(
-        "⚠️ 중복 사용 여부를 확인하면 추천을 더 정확하게 다시 계산할 수 있습니다."
+        "⚠️ 최적 결제금액을 확정하려면 딱 한 가지 확인이 필요합니다."
     )
 
-    for idx, pair in enumerate(pair_questions[:3]):
-        key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
-        current_value = st.session_state.get("benefit_relations", {}).get(key)
+    answer = st.radio(
+        f"**{pair['a_name']}**과 **{pair['b_name']}**을 함께 사용할 수 있나요?",
+        ["잘 모르겠어요", "중복 가능", "중복 불가"],
+        horizontal=True,
+        key=f"critical_relation_{key}",
+    )
 
-        default_index = 0
-        if current_value == "possible":
-            default_index = 1
-        elif current_value == "not_possible":
-            default_index = 2
+    new_value = None
+    if answer == "중복 가능":
+        new_value = "possible"
+    elif answer == "중복 불가":
+        new_value = "not_possible"
 
-        answer = st.radio(
-            f"{pair['a_name']} + {pair['b_name']}",
-            ["아직 모르겠어요", "중복 가능", "중복 불가"],
-            index=default_index,
-            horizontal=True,
-            key=f"relation_{idx}_{key}",
+    if new_value is not None and new_value != current_value:
+        relations = st.session_state.get("benefit_relations", {}).copy()
+        relations[key] = new_value
+        st.session_state["benefit_relations"] = relations
+        st.success("확인 결과를 반영해 최적 결제 방법을 다시 계산합니다.")
+        st.rerun()
+
+    if answer == "잘 모르겠어요":
+        st.caption(
+            "확인하지 않아도 됩니다. 아래의 조건 확인 없이 선택 가능한 대안을 이용할 수 있습니다."
         )
-
-        new_value = None
-        if answer == "중복 가능":
-            new_value = "possible"
-        elif answer == "중복 불가":
-            new_value = "not_possible"
-
-        if new_value is not None and new_value != current_value:
-            relations = st.session_state.get("benefit_relations", {}).copy()
-            relations[key] = new_value
-            st.session_state["benefit_relations"] = relations
-            st.success("확인 결과를 반영해 다시 계산합니다.")
-            st.rerun()
 
 # =========================================================
 # 4. 그 밖의 확인할 조건
@@ -1204,6 +1218,32 @@ if confirmed_alternative is not None or alternatives:
 # =========================================================
 # 5. 계산 근거 — 필요할 때만
 # =========================================================
+with st.expander("🤖 AI가 판단한 혜택 관계 보기"):
+    relation_meta = st.session_state.get("ai_benefit_relation_meta", {})
+
+    if not relation_meta:
+        st.write("AI가 별도로 확정한 혜택 간 관계가 없습니다.")
+    else:
+        shown = 0
+        for meta in relation_meta.values():
+            if meta.get("confidence") not in {"high", "medium"}:
+                continue
+            relation_text = (
+                "중복 가능"
+                if meta.get("relation") == "possible"
+                else "동시 사용 불가"
+                if meta.get("relation") == "not_possible"
+                else "확인 필요"
+            )
+            st.write(
+                f"- **{meta.get('a_name')} + {meta.get('b_name')}**: "
+                f"{relation_text} · {meta.get('reason', '')} "
+                f"({meta.get('confidence')} confidence)"
+            )
+            shown += 1
+            if shown >= 5:
+                break
+
 with st.expander("🧮 계산 근거 보기"):
     st.write(
         "상품 묶음과 분할 결제 여부, 쿠폰·멤버십·결제 혜택의 "
