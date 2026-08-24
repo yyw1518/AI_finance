@@ -19,6 +19,14 @@ USER_CONDITION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "target_benefit_name": {"type": "string"},
+                    "scope_type": {
+                        "type": "string",
+                        "enum": ["cart", "brand", "product", "seller", "category", "unknown", "no_change"],
+                    },
+                    "scope_targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "eligible_brands": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -44,6 +52,8 @@ USER_CONDITION_SCHEMA = {
                 },
                 "required": [
                     "target_benefit_name",
+                    "scope_type",
+                    "scope_targets",
                     "eligible_brands",
                     "eligible_items",
                     "excluded_items",
@@ -100,8 +110,11 @@ def user_condition_prompt(note, benefit_names, products_context):
 
 규칙:
 - target_benefit_name은 반드시 현재 혜택명 중 가장 알맞은 이름을 그대로 사용한다.
-- "이 쿠폰은 라운드랩에만 적용돼"라면 해당 쿠폰의 eligible_brands=["라운드랩"].
-- "A 쿠폰은 B 상품에만 적용돼"라면 eligible_items에 B를 넣는다.
+- "이 쿠폰은 라운드랩에만 적용돼" -> scope_type="brand", scope_targets=["라운드랩"].
+- "A 쿠폰은 B 상품에만 적용돼" -> scope_type="product", scope_targets=["B"].
+- "OO스토어 상품에만 적용돼" -> scope_type="seller", scope_targets=["OO스토어"].
+- "스킨케어에만 적용돼" -> scope_type="category", scope_targets=["스킨케어"].
+- "장바구니 전체에 적용돼" -> scope_type="cart", scope_targets=[].
 - "A 쿠폰은 다른 쿠폰과 중복 안 돼"라면 stack_coupon="not_possible".
 - "A 쿠폰은 카드 할인과 중복돼"라면 stack_payment="possible".
 - "A 혜택과 B 혜택은 같이 못 써"라면 relation_updates에 두 혜택 관계를 not_possible로 넣는다.
@@ -188,8 +201,24 @@ def apply_condition_to_saved_benefits(
         i = matches[0]
         benefit = updated[i]
 
+        scope_type = update.get("scope_type", "no_change")
+        scope_targets = update.get("scope_targets", []) or []
         brands = update.get("eligible_brands", []) or []
         items = update.get("eligible_items", []) or []
+
+        if scope_type != "no_change":
+            benefit["scope_type"] = scope_type
+            benefit["scope_targets"] = scope_targets
+            benefit["scope_confidence"] = "high"
+
+            # legacy compatibility
+            benefit["eligible_brands"] = (
+                scope_targets if scope_type == "brand" else []
+            )
+            benefit["eligible_items"] = (
+                scope_targets if scope_type == "product" else []
+            )
+
         excluded = str(
             update.get("excluded_items", "")
         ).strip()
@@ -401,43 +430,72 @@ def normalize_text(value):
     return str(value or "").strip().lower().replace(" ", "")
 
 
-def benefit_target_indices(group_indices, benefit):
-    """혜택이 실제 적용되는 상품 인덱스만 반환."""
-    eligible_brands = benefit.get("eligible_brands", []) or []
-    eligible_items = benefit.get("eligible_items", []) or []
+def fuzzy_target_match(value, targets):
+    value = normalize_text(value)
+    if not value:
+        return False
 
-    # 전체 적용 혜택
-    if not eligible_brands and not eligible_items:
+    normalized_targets = [
+        normalize_text(target)
+        for target in targets
+        if normalize_text(target)
+    ]
+
+    return any(
+        value == target
+        or target in value
+        or value in target
+        for target in normalized_targets
+    )
+
+
+def benefit_scope(benefit):
+    scope_type = str(
+        benefit.get("scope_type", "")
+    ).strip().lower()
+    scope_targets = benefit.get("scope_targets", []) or []
+
+    # 이전 데이터와 호환
+    if not scope_type or scope_type == "unknown":
+        legacy_brands = benefit.get("eligible_brands", []) or []
+        legacy_items = benefit.get("eligible_items", []) or []
+
+        if legacy_brands:
+            return "brand", legacy_brands
+        if legacy_items:
+            return "product", legacy_items
+
+    return scope_type or "cart", scope_targets
+
+
+def benefit_target_indices(group_indices, benefit):
+    """플랫폼과 무관한 공통 scope 기준으로 실제 적용 상품을 찾는다."""
+    scope_type, targets = benefit_scope(benefit)
+
+    if scope_type == "cart":
         return list(group_indices)
 
-    brand_targets = {normalize_text(x) for x in eligible_brands if normalize_text(x)}
-    item_targets = {normalize_text(x) for x in eligible_items if normalize_text(x)}
+    if scope_type == "unknown":
+        # 범위를 모르는 혜택은 전체 적용으로 확정하지 않음.
+        return []
 
     matched = []
 
     for i in group_indices:
         product = products[i]
-        product_brand = normalize_text(product.get("brand", ""))
-        product_name = normalize_text(product.get("name", ""))
 
-        brand_match = (
-            bool(brand_targets)
-            and (
-                product_brand in brand_targets
-                or any(target in product_brand or product_brand in target for target in brand_targets if product_brand)
-            )
-        )
+        if scope_type == "brand":
+            candidate = product.get("brand", "")
+        elif scope_type == "product":
+            candidate = product.get("name", "")
+        elif scope_type == "seller":
+            candidate = product.get("seller", "")
+        elif scope_type == "category":
+            candidate = product.get("category", "")
+        else:
+            candidate = ""
 
-        item_match = (
-            bool(item_targets)
-            and any(
-                target in product_name or product_name in target
-                for target in item_targets
-                if product_name
-            )
-        )
-
-        if brand_match or item_match:
+        if fuzzy_target_match(candidate, targets):
             matched.append(i)
 
     return matched
@@ -446,7 +504,10 @@ def benefit_target_indices(group_indices, benefit):
 def benefit_target_subtotal(group_indices, benefit):
     return sum(
         product_line_total(products[i])
-        for i in benefit_target_indices(group_indices, benefit)
+        for i in benefit_target_indices(
+            group_indices,
+            benefit,
+        )
     )
 
 
@@ -964,6 +1025,8 @@ def apply_benefit_subset(starting_price, selected_benefits, group_indices):
                         "category_label",
                         benefit.get("category", "")
                     ),
+                    "scope_type": benefit_scope(benefit)[0],
+                    "scope_targets": benefit_scope(benefit)[1],
                     "eligible_brands": benefit.get("eligible_brands", []) or [],
                     "eligible_items": benefit.get("eligible_items", []) or [],
                     "before": round(before),
@@ -1399,6 +1462,24 @@ else:
     st.success(f"총 **{money(immediate_saving)}** 절약할 수 있습니다.")
 
 
+# AI가 적용 범위를 모르는 혜택이 있으면 계산에 무리하게 포함하지 않음
+unknown_scope_benefits = [
+    benefit
+    for benefit in benefits
+    if benefit_scope(benefit)[0] == "unknown"
+]
+
+if unknown_scope_benefits:
+    with st.expander(
+        f"⚠️ 적용 범위를 확인하지 못한 혜택 {len(unknown_scope_benefits)}개"
+    ):
+        st.caption(
+            "이 혜택들은 적용 대상을 확정할 수 없어 최적화에서 보수적으로 처리했습니다. "
+            "필요하면 아래 '실제 조건과 다른 부분 수정'에서 자연어로 알려주세요."
+        )
+        for benefit in unknown_scope_benefits[:5]:
+            st.write(f"- {benefit.get('name', '혜택')}")
+
 # =========================================================
 # 실제 조건과 다른 부분 수정
 # =========================================================
@@ -1519,10 +1600,21 @@ for payment_no, choice in enumerate(best_option["choices"], start=1):
             for step in plan["steps"]:
                 if step["discount"] > 0:
                     target_label = ""
-                    if step.get("eligible_brands"):
-                        target_label = f" ({', '.join(step['eligible_brands'])} 대상)"
-                    elif step.get("eligible_items"):
-                        target_label = " (특정 상품 대상)"
+                    scope_type = step.get("scope_type", "cart")
+                    scope_targets = step.get("scope_targets", []) or []
+
+                    scope_names = {
+                        "brand": "브랜드",
+                        "product": "상품",
+                        "seller": "판매자",
+                        "category": "카테고리",
+                    }
+
+                    if scope_type in scope_names and scope_targets:
+                        target_label = (
+                            f" ({scope_names[scope_type]}: "
+                            f"{', '.join(scope_targets)} 대상)"
+                        )
 
                     st.write(
                         f"→ **{step['name']}**{target_label} · {money(step['discount'])} 할인"
