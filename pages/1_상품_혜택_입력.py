@@ -63,11 +63,16 @@ EXTRACTION_SCHEMA = {
                 "properties": {
                     "name": {"type": "string"},
                     "brand": {"type": "string"},
+                    "seller": {"type": "string"},
+                    "category": {"type": "string"},
                     "price": {"type": "number"},
                     "quantity": {"type": "integer"},
                     "price_known": {"type": "boolean"},
                 },
-                "required": ["name", "brand", "price", "quantity", "price_known"],
+                "required": [
+                    "name", "brand", "seller", "category",
+                    "price", "quantity", "price_known"
+                ],
                 "additionalProperties": False,
             },
         },
@@ -126,15 +131,34 @@ EXTRACTION_SCHEMA = {
                         "enum": ["starting_price", "before_benefit", "unknown"],
                     },
                     "required_payment_method": {"type": "string"},
+                    "scope_type": {
+                        "type": "string",
+                        "enum": ["cart", "brand", "product", "seller", "category", "unknown"],
+                        "description": (
+                            "혜택 적용 범위. 장바구니 전체=cart, 특정 브랜드=brand, "
+                            "특정 상품=product, 특정 판매자= seller, 특정 카테고리=category, "
+                            "판단 불가=unknown."
+                        ),
+                    },
+                    "scope_targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "scope_type의 실제 대상명 목록. cart이면 빈 배열. "
+                            "예: brand이면 ['라운드랩'], category이면 ['스킨케어']."
+                        ),
+                    },
+                    "scope_confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
                     "eligible_brands": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "이 혜택이 적용되는 브랜드 목록. 전체 적용이면 빈 배열.",
                     },
                     "eligible_items": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "특정 상품/상품군에만 적용되는 경우 대상명. 전체 적용이면 빈 배열.",
                     },
                     "excluded_items": {"type": "string"},
                     "exclusive_group": {"type": "string"},
@@ -165,6 +189,9 @@ EXTRACTION_SCHEMA = {
                     "reuse_type",
                     "min_purchase_basis",
                     "required_payment_method",
+                    "scope_type",
+                    "scope_targets",
+                    "scope_confidence",
                     "eligible_brands",
                     "eligible_items",
                     "excluded_items",
@@ -230,6 +257,14 @@ USER_CONDITION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "target_benefit_name": {"type": "string"},
+                    "scope_type": {
+                        "type": "string",
+                        "enum": ["cart", "brand", "product", "seller", "category", "unknown", "no_change"],
+                    },
+                    "scope_targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "eligible_brands": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -255,6 +290,8 @@ USER_CONDITION_SCHEMA = {
                 },
                 "required": [
                     "target_benefit_name",
+                    "scope_type",
+                    "scope_targets",
                     "eligible_brands",
                     "eligible_items",
                     "excluded_items",
@@ -311,8 +348,12 @@ def user_condition_prompt(note, benefit_names, products_context):
 
 규칙:
 - target_benefit_name은 반드시 현재 혜택명 중 가장 알맞은 이름을 그대로 사용한다.
-- "이 쿠폰은 라운드랩에만 적용돼"라면 해당 쿠폰의 eligible_brands=["라운드랩"].
-- "A 쿠폰은 B 상품에만 적용돼"라면 eligible_items에 B를 넣는다.
+- "이 쿠폰은 라운드랩에만 적용돼" -> scope_type="brand", scope_targets=["라운드랩"].
+- "A 쿠폰은 B 상품에만 적용돼" -> scope_type="product", scope_targets=["B"].
+- "이 쿠폰은 OO스토어에서만 돼" -> scope_type="seller", scope_targets=["OO스토어"].
+- "스킨케어에만 적용돼" -> scope_type="category", scope_targets=["스킨케어"].
+- "장바구니 전체에 적용돼" -> scope_type="cart", scope_targets=[].
+- 호환성을 위해 brand/product인 경우 eligible_brands/eligible_items에도 같은 값을 넣어도 된다.
 - "A 쿠폰은 다른 쿠폰과 중복 안 돼"라면 stack_coupon="not_possible".
 - "A 쿠폰은 카드 할인과 중복돼"라면 stack_payment="possible".
 - "A 혜택과 B 혜택은 같이 못 써"라면 relation_updates에 두 혜택 관계를 not_possible로 넣는다.
@@ -341,12 +382,40 @@ ANALYSIS_PROMPT = """
 - "~함", "~기재함", "~확인됨" 같은 보고서체는 사용하지 않는다.
 
 [상품]
-- 장바구니, 상품 상세, 주문 화면에 상품명·브랜드·가격·수량이 보이면 products에 넣는다.
+- 장바구니, 상품 상세, 주문 화면에 상품명·브랜드·판매자·카테고리·가격·수량이 보이면 products에 넣는다.
 - 상품명 앞/위에 브랜드명이 따로 보이면 brand에 분리해서 적는다.
 - 브랜드를 확실히 알 수 없으면 brand는 빈 문자열로 둔다.
 - 가격을 확실히 못 읽으면 price=0, price_known=false.
 - 상품 화면이 없으면 products는 빈 배열이어도 된다.
 
+
+
+[혜택 적용 범위(scope) 분석 - 매우 중요]
+각 혜택은 쇼핑몰 이름과 무관하게 아래 공통 구조로 변환한다.
+
+- cart: 장바구니/주문 전체에 적용
+- brand: 특정 브랜드 상품에만 적용
+- product: 특정 상품 또는 명시된 상품군에만 적용
+- seller: 특정 판매자/스토어/입점사 상품에만 적용
+- category: 특정 카테고리에만 적용
+- unknown: 캡처만으로 적용 범위를 판단하기 어려움
+
+scope_targets에는 실제 대상명만 넣는다.
+예:
+- "라운드랩 20% 쿠폰" -> scope_type="brand", scope_targets=["라운드랩"]
+- "스킨케어 15% 쿠폰" -> scope_type="category", scope_targets=["스킨케어"]
+- "OO스토어 전용 쿠폰" -> scope_type="seller", scope_targets=["OO스토어"]
+- "장바구니 10만원 이상 1만원" -> scope_type="cart", scope_targets=[]
+- 특정 상품 하나에만 붙은 쿠폰 -> scope_type="product", scope_targets=[상품명]
+
+중요:
+- '브랜드 쿠폰', '상품 쿠폰', '스토어 쿠폰' 같은 이름만 기계적으로 믿지 말고
+  화면의 대상명, 상품 정보, 조건 문구를 함께 본다.
+- 대상이 명확히 보이면 high.
+- 문맥상 합리적으로 추론 가능하면 medium.
+- 적용 범위 또는 대상이 불확실하면 low 또는 unknown.
+- low/unknown은 사용자가 빠르게 검수할 수 있도록 그대로 남긴다.
+- 특정 플랫폼 이름을 기준으로 규칙을 하드코딩하지 않는다.
 
 [브랜드/상품 한정 혜택 - 매우 중요]
 - "OOO 브랜드 20% 쿠폰", "라운드랩 전용", "일부 브랜드 전용", "특정 브랜드 상품에만 적용"처럼
@@ -585,8 +654,15 @@ def apply_condition_to_editor_df(benefit_df, result):
 
         idx = matches[0]
 
+        scope_type = update.get("scope_type", "no_change")
+        scope_targets = update.get("scope_targets", []) or []
         brands = update.get("eligible_brands", []) or []
         items = update.get("eligible_items", []) or []
+
+        if scope_type != "no_change":
+            updated.at[idx, "적용범위"] = scope_type
+            updated.at[idx, "적용대상"] = ", ".join(scope_targets)
+            updated.at[idx, "범위확신도"] = "high"
         excluded = str(update.get("excluded_items", "")).strip()
         required_payment = str(
             update.get("required_payment_method", "")
@@ -675,6 +751,8 @@ def ai_products_to_df(products):
             {
                 "상품명": product.get("name", ""),
                 "브랜드": product.get("brand", ""),
+                "판매자": product.get("seller", ""),
+                "카테고리": product.get("category", ""),
                 "가격": product.get("price", 0),
                 "수량": product.get("quantity", 1),
                 "가격확인": "확인" if product.get("price_known", False) else "확인 필요",
@@ -682,7 +760,7 @@ def ai_products_to_df(products):
         )
 
     if not rows:
-        rows = [{"상품명": "", "브랜드": "", "가격": 0, "수량": 1, "가격확인": "확인 필요"}]
+        rows = [{"상품명": "", "브랜드": "", "판매자": "", "카테고리": "", "가격": 0, "수량": 1, "가격확인": "확인 필요"}]
 
     return pd.DataFrame(rows)
 
@@ -715,6 +793,9 @@ def ai_benefits_to_df(benefits):
                 "분할결제재사용": REUSE_TO_KR.get(benefit.get("reuse_type"), "확인 필요"),
                 "최소금액기준": BASIS_TO_KR.get(benefit.get("min_purchase_basis"), "확인 필요"),
                 "필수결제수단": benefit.get("required_payment_method", ""),
+                "적용범위": benefit.get("scope_type", "unknown"),
+                "적용대상": ", ".join(benefit.get("scope_targets", []) or []),
+                "범위확신도": benefit.get("scope_confidence", "low"),
                 "적용브랜드": ", ".join(benefit.get("eligible_brands", []) or []),
                 "적용상품": ", ".join(benefit.get("eligible_items", []) or []),
                 "제외대상": benefit.get("excluded_items", ""),
@@ -747,6 +828,9 @@ def ai_benefits_to_df(benefits):
                 "분할결제재사용": "확인 필요",
                 "최소금액기준": "확인 필요",
                 "필수결제수단": "",
+                "적용범위": "unknown",
+                "적용대상": "",
+                "범위확신도": "low",
                 "적용브랜드": "",
                 "적용상품": "",
                 "제외대상": "",
@@ -928,10 +1012,9 @@ if "gemini_analysis_result" in st.session_state:
         key="gemini_product_editor",
         column_config={
             "상품명": st.column_config.TextColumn("상품명"),
-            "브랜드": st.column_config.TextColumn(
-                "브랜드",
-                help="브랜드 전용 쿠폰 계산에 사용합니다."
-            ),
+            "브랜드": st.column_config.TextColumn("브랜드"),
+            "판매자": st.column_config.TextColumn("판매자"),
+            "카테고리": st.column_config.TextColumn("카테고리"),
             "가격": st.column_config.NumberColumn(
                 "가격",
                 min_value=0,
@@ -980,7 +1063,7 @@ if "gemini_analysis_result" in st.session_state:
         width="stretch",
         key="gemini_benefit_editor",
         column_order=[
-            "삭제", "혜택명", "분류", "제공사", "적용브랜드", "할인방식", "할인값",
+            "삭제", "혜택명", "분류", "제공사", "적용범위", "적용대상", "할인방식", "할인값",
             "최소결제금액", "최대할인금액", "사용채널", "유효기간"
         ],
         column_config={
@@ -988,9 +1071,14 @@ if "gemini_analysis_result" in st.session_state:
             "혜택명": st.column_config.TextColumn("혜택명"),
             "분류": st.column_config.SelectboxColumn("분류", options=list(CATEGORY_TO_KR.values())),
             "제공사": st.column_config.TextColumn("제공사"),
-            "적용브랜드": st.column_config.TextColumn(
-                "적용브랜드",
-                help="브랜드 전용 혜택이면 대상 브랜드가 표시됩니다. 여러 개면 쉼표로 구분합니다."
+            "적용범위": st.column_config.SelectboxColumn(
+                "적용범위",
+                options=["cart", "brand", "product", "seller", "category", "unknown"],
+                help="장바구니 전체/브랜드/상품/판매자/카테고리 중 혜택 적용 범위입니다."
+            ),
+            "적용대상": st.column_config.TextColumn(
+                "적용대상",
+                help="특정 대상이 있으면 이름을 적습니다. 여러 개면 쉼표로 구분합니다."
             ),
             "할인방식": st.column_config.SelectboxColumn("할인방식", options=list(DISCOUNT_TO_KR.values())),
             "할인값": st.column_config.NumberColumn("할인값", min_value=0, format="localized"),
@@ -1017,6 +1105,147 @@ if "gemini_analysis_result" in st.session_state:
     edited_benefits = edited_benefits.loc[
         ~edited_benefits["삭제"].fillna(False).astype(bool)
     ].drop(columns=["삭제"], errors="ignore")
+
+    # AI가 적용 범위를 확신하지 못한 혜택만 빠르게 검수
+    scope_review_indices = []
+
+    for idx, row in edited_benefits.iterrows():
+        scope_type = str(row.get("적용범위", "unknown")).strip()
+        confidence = str(row.get("범위확신도", "low")).strip()
+
+        if scope_type == "unknown" or confidence == "low":
+            scope_review_indices.append(idx)
+
+    if scope_review_indices:
+        st.warning(
+            f"⚠️ 혜택 {len(scope_review_indices)}개의 적용 범위만 확인해주세요."
+        )
+
+        with st.expander("🎯 적용 범위 빠른 확인", expanded=True):
+            st.caption(
+                "AI가 확실하지 않은 항목만 보여드립니다. "
+                "확실한 혜택은 따로 확인하지 않으셔도 됩니다."
+            )
+
+            scope_label_to_code = {
+                "장바구니 전체": "cart",
+                "특정 브랜드": "brand",
+                "특정 상품": "product",
+                "특정 판매자/스토어": "seller",
+                "특정 카테고리": "category",
+                "잘 모르겠어요": "unknown",
+            }
+
+            for idx in scope_review_indices[:3]:
+                row = edited_benefits.loc[idx]
+                benefit_name = str(row.get("혜택명", "혜택"))
+
+                current_code = str(
+                    row.get("적용범위", "unknown")
+                ).strip()
+
+                reverse_scope = {
+                    value: key
+                    for key, value in scope_label_to_code.items()
+                }
+                current_label = reverse_scope.get(
+                    current_code,
+                    "잘 모르겠어요",
+                )
+
+                labels = list(scope_label_to_code.keys())
+                default_index = (
+                    labels.index(current_label)
+                    if current_label in labels
+                    else len(labels) - 1
+                )
+
+                selected_label = st.selectbox(
+                    f"{benefit_name} 적용 범위",
+                    labels,
+                    index=default_index,
+                    key=f"scope_review_type_{idx}",
+                )
+
+                selected_code = scope_label_to_code[
+                    selected_label
+                ]
+
+                targets = ""
+
+                if selected_code != "cart" and selected_code != "unknown":
+                    suggestions = []
+
+                    if selected_code == "brand":
+                        suggestions = [
+                            str(x).strip()
+                            for x in edited_products.get(
+                                "브랜드", []
+                            ).tolist()
+                            if str(x).strip()
+                        ]
+                    elif selected_code == "seller":
+                        suggestions = [
+                            str(x).strip()
+                            for x in edited_products.get(
+                                "판매자", []
+                            ).tolist()
+                            if str(x).strip()
+                        ]
+                    elif selected_code == "category":
+                        suggestions = [
+                            str(x).strip()
+                            for x in edited_products.get(
+                                "카테고리", []
+                            ).tolist()
+                            if str(x).strip()
+                        ]
+                    elif selected_code == "product":
+                        suggestions = [
+                            str(x).strip()
+                            for x in edited_products.get(
+                                "상품명", []
+                            ).tolist()
+                            if str(x).strip()
+                        ]
+
+                    suggestions = list(dict.fromkeys(suggestions))
+
+                    if suggestions:
+                        chosen = st.multiselect(
+                            "적용 대상",
+                            suggestions,
+                            key=f"scope_review_targets_{idx}",
+                        )
+                        targets = ", ".join(chosen)
+                    else:
+                        targets = st.text_input(
+                            "적용 대상",
+                            value=str(row.get("적용대상", "")),
+                            placeholder="대상 이름을 입력해주세요.",
+                            key=f"scope_review_target_text_{idx}",
+                        )
+
+                if st.button(
+                    "이 조건으로 확인",
+                    key=f"confirm_scope_{idx}",
+                ):
+                    working = edited_benefits.copy()
+                    working.at[idx, "적용범위"] = selected_code
+                    working.at[idx, "적용대상"] = targets
+                    working.at[idx, "범위확신도"] = (
+                        "high"
+                        if selected_code != "unknown"
+                        else "low"
+                    )
+
+                    st.session_state["benefit_working_df"] = working
+                    st.session_state.pop(
+                        "gemini_benefit_editor",
+                        None,
+                    )
+                    st.success("적용 범위를 반영했습니다.")
+                    st.rerun()
 
     with st.expander("✏️ AI에게 추가 조건 알려주기"):
         st.caption(
@@ -1137,6 +1366,8 @@ if "gemini_analysis_result" in st.session_state:
                     "id": f"product_{index}",
                     "name": name,
                     "brand": clean_text(row.get("브랜드", "")),
+                    "seller": clean_text(row.get("판매자", "")),
+                    "category": clean_text(row.get("카테고리", "")),
                     "price": price,
                     "quantity": quantity,
                     "total": price * quantity,
@@ -1211,8 +1442,19 @@ if "gemini_analysis_result" in st.session_state:
                     ),
                     "min_purchase_basis_label": row.get("최소금액기준", "확인 필요"),
                     "required_payment_method": clean_text(row.get("필수결제수단", "")),
-                    "eligible_brands": split_list_text(row.get("적용브랜드", "")),
-                    "eligible_items": split_list_text(row.get("적용상품", "")),
+                    "scope_type": clean_text(row.get("적용범위", "unknown")) or "unknown",
+                    "scope_targets": split_list_text(row.get("적용대상", "")),
+                    "scope_confidence": clean_text(row.get("범위확신도", "low")) or "low",
+                    "eligible_brands": (
+                        split_list_text(row.get("적용대상", ""))
+                        if clean_text(row.get("적용범위", "")) == "brand"
+                        else []
+                    ),
+                    "eligible_items": (
+                        split_list_text(row.get("적용대상", ""))
+                        if clean_text(row.get("적용범위", "")) == "product"
+                        else []
+                    ),
                     "excluded_items": clean_text(row.get("제외대상", "")),
                     "exclusive_group": clean_text(row.get("택일그룹", "")),
                     "exclusive_group_reason": clean_text(row.get("택일그룹근거", "")),
