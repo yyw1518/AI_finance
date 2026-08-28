@@ -748,6 +748,192 @@ def _infer_exclusive_groups_locally(benefits):
             )
 
 
+
+def _norm_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _parse_korean_money(text):
+    """플랫폼명과 무관하게 한국어 금액 표현을 숫자로 정규화합니다."""
+    s = _norm_text(text).replace(",", "")
+    if not s:
+        return 0.0
+
+    # 9만원 / 1.5만원 / 9천원 / 5000원
+    m = re.search(r"(\d+(?:\.\d+)?)\s*만\s*원", s)
+    if m:
+        return float(m.group(1)) * 10000
+    m = re.search(r"(\d+(?:\.\d+)?)\s*천\s*원", s)
+    if m:
+        return float(m.group(1)) * 1000
+    m = re.search(r"(\d+(?:\.\d+)?)\s*원", s)
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+
+def _infer_min_purchase(text):
+    s = _norm_text(text)
+    patterns = [
+        r"(\d+(?:\.\d+)?)\s*만\s*원\s*(?:이상|초과)",
+        r"(\d+(?:\.\d+)?)\s*천\s*원\s*(?:이상|초과)",
+        r"(\d[\d,]*)\s*원\s*(?:이상|초과)",
+    ]
+    for p in patterns:
+        m = re.search(p, s)
+        if m:
+            token = m.group(0)
+            return _parse_korean_money(token)
+    return 0.0
+
+
+def _infer_value_and_type(text, raw_type="", raw_value=0):
+    """
+    쇼핑몰/브랜드 이름을 보지 않고 '혜택 표현' 자체로 계산 타입을 결정합니다.
+    """
+    s = _norm_text(text)
+    raw_type = _norm_text(raw_type).lower()
+    try:
+        raw_value = float(raw_value or 0)
+    except Exception:
+        raw_value = 0.0
+
+    # 포인트/적립은 결제금액 차감이 아니라 reward로 다루기 위해 points 사용
+    if re.search(r"(포인트|point|p\b).*(적립|지급)|(\d[\d,]*)\s*p\b", s, re.I) or "적립" in s:
+        amounts = re.findall(r"(\d[\d,]*)\s*(?:p|포인트)", s, re.I)
+        if amounts:
+            return "points", float(amounts[-1].replace(",", ""))
+        money_candidates = re.findall(r"(\d+(?:\.\d+)?)\s*(만|천)?\s*원", s)
+        if money_candidates:
+            num, unit = money_candidates[-1]
+            mult = 10000 if unit == "만" else 1000 if unit == "천" else 1
+            return "points", float(num) * mult
+        if raw_value > 0:
+            return "points", raw_value
+
+    # 퍼센트 할인
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:즉시\s*)?(?:할인|적립)?", s)
+    if m:
+        return "percent", float(m.group(1))
+
+    # 무료배송은 상품대금 할인과 분리. 현 optimizer에서는 0원 금전효과.
+    if re.search(r"무료\s*배송|배송비\s*무료", s):
+        return "shipping", 0.0
+
+    # 정액 할인: '이상' 기준금액과 할인액이 함께 있으면 할인/즉시할인 쪽 금액을 우선
+    discount_patterns = [
+        r"(\d+(?:\.\d+)?)\s*만\s*원\s*(?:즉시\s*)?할인",
+        r"(\d+(?:\.\d+)?)\s*천\s*원\s*(?:즉시\s*)?할인",
+        r"(\d[\d,]*)\s*원\s*(?:즉시\s*)?할인",
+    ]
+    for p in discount_patterns:
+        m = re.search(p, s)
+        if m:
+            return "fixed", _parse_korean_money(m.group(0))
+
+    if raw_type in {"fixed", "percent", "points"} and raw_value > 0:
+        return raw_type, raw_value
+
+    return "unknown", raw_value
+
+
+def _infer_required_payment_method(raw):
+    """
+    특정 플랫폼 목록을 하드코딩하지 않습니다.
+    AI가 읽은 required_payment_method를 최우선 사용하고,
+    결제혜택 문구에서는 제공사/issuer를 일반적인 결제수단 후보로 보완합니다.
+    """
+    explicit = _norm_text(raw.get("required_payment_method", ""))
+    if explicit:
+        return explicit
+
+    text = _norm_text(" ".join([
+        str(raw.get("name", "")),
+        str(raw.get("raw_conditions", "")),
+    ]))
+    issuer = _norm_text(raw.get("issuer", ""))
+
+    payment_words = ("결제", "페이", "pay", "카드", "간편결제")
+    if issuer and any(word.lower() in text.lower() for word in payment_words):
+        return issuer
+    return ""
+
+
+def _normalize_benefit(raw, idx):
+    name = _norm_text(raw.get("name", ""))
+    conditions = _norm_text(raw.get("raw_conditions", ""))
+    combined = _norm_text(f"{name} {conditions}")
+
+    min_purchase = 0.0
+    try:
+        min_purchase = float(raw.get("min_purchase", 0) or 0)
+    except Exception:
+        pass
+    if min_purchase <= 0:
+        min_purchase = _infer_min_purchase(combined)
+
+    discount_type, value = _infer_value_and_type(
+        combined,
+        raw.get("discount_type", ""),
+        raw.get("value", 0),
+    )
+
+    scope_type = _norm_text(raw.get("scope_type", "unknown")) or "unknown"
+    scope_targets = raw.get("scope_targets", []) or []
+    if not isinstance(scope_targets, list):
+        scope_targets = [scope_targets]
+
+    category = _norm_text(raw.get("category", "")).lower()
+    if discount_type == "shipping":
+        category = "shipping"
+    elif discount_type == "points" and category in {"", "other", "기타"}:
+        category = "payment"
+    elif _infer_required_payment_method(raw) and category in {"", "other", "기타"}:
+        category = "payment"
+    elif "쿠폰" in combined and category in {"", "other", "기타"}:
+        category = "coupon"
+
+    max_discount = 0.0
+    try:
+        max_discount = float(raw.get("max_discount", 0) or 0)
+    except Exception:
+        pass
+
+    return {
+        "id": f"benefit_{idx}",
+        "name": name,
+        "category": category or "other",
+        "issuer": _norm_text(raw.get("issuer", "")),
+        "discount_type": discount_type,
+        "value": value,
+        "min_purchase": min_purchase,
+        "min_purchase_known": min_purchase > 0 or discount_type == "shipping",
+        "max_discount": max_discount,
+        "min_purchase_basis": "target",
+        "channel": _norm_text(raw.get("channel", "")),
+        "expiry": _norm_text(raw.get("expiry", "")),
+        "stack_coupon": None,
+        "stack_membership": None,
+        "stack_payment": None,
+        "reuse_type": "unknown",
+        "required_payment_method": _infer_required_payment_method(raw),
+        "excluded_items": _norm_text(raw.get("excluded_items", "")),
+        "conditions": conditions,
+        "scope_type": scope_type,
+        "scope_targets": [_norm_text(x) for x in scope_targets if _norm_text(x)],
+        "scope_confidence": _norm_text(raw.get("scope_confidence", "low")) or "low",
+        "eligible_brands": (
+            [_norm_text(x) for x in scope_targets if _norm_text(x)]
+            if scope_type == "brand" else []
+        ),
+        "eligible_items": (
+            [_norm_text(x) for x in scope_targets if _norm_text(x)]
+            if scope_type == "product" else []
+        ),
+        "exclusive_group": "",
+        "exclusive_group_reason": "",
+    }
+
 def finalize_first_pass_locally(first_result):
     """
     1차 이미지 판독 결과를 추가 Gemini 호출 없이
@@ -760,67 +946,7 @@ def finalize_first_pass_locally(first_result):
     benefits = []
 
     for idx, raw in enumerate(raw_benefits, start=1):
-        scope_type = str(
-            raw.get("scope_type", "unknown")
-        ).strip() or "unknown"
-
-        scope_targets = raw.get("scope_targets", []) or []
-        confidence = str(
-            raw.get("scope_confidence", "low")
-        ).strip() or "low"
-
-        benefit = {
-            "id": f"benefit_{idx}",
-            "name": str(raw.get("name", "")).strip(),
-            "category": str(raw.get("category", "")).strip(),
-            "issuer": str(raw.get("issuer", "")).strip(),
-            "discount_type": str(
-                raw.get("discount_type", "")
-            ).strip(),
-            "value": float(raw.get("value", 0) or 0),
-            "min_purchase": float(
-                raw.get("min_purchase", 0) or 0
-            ),
-            "max_discount": float(
-                raw.get("max_discount", 0) or 0
-            ),
-            "min_purchase_basis": "target",
-            "channel": str(raw.get("channel", "")).strip(),
-            "expiry": str(raw.get("expiry", "")).strip(),
-
-            # 중복관계는 이미지에서 명시되지 않았다면
-            # 억지로 추론하지 않고 사용자 검수 대상으로 남깁니다.
-            "stack_coupon": None,
-            "stack_membership": None,
-            "stack_payment": None,
-
-            "reuse_type": "unknown",
-            "required_payment_method": str(
-                raw.get("required_payment_method", "")
-            ).strip(),
-            "excluded_items": str(
-                raw.get("excluded_items", "")
-            ).strip(),
-            "conditions": str(
-                raw.get("raw_conditions", "")
-            ).strip(),
-
-            "scope_type": scope_type,
-            "scope_targets": scope_targets,
-            "scope_confidence": confidence,
-
-            # 이전 2번 페이지와의 호환성 유지
-            "eligible_brands": (
-                scope_targets if scope_type == "brand" else []
-            ),
-            "eligible_items": (
-                scope_targets if scope_type == "product" else []
-            ),
-
-            "exclusive_group": "",
-            "exclusive_group_reason": "",
-        }
-        benefits.append(benefit)
+        benefits.append(_normalize_benefit(raw, idx))
 
     _infer_exclusive_groups_locally(benefits)
 
