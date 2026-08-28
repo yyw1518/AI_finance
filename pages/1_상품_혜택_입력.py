@@ -8,6 +8,7 @@ from PIL import Image
 import pandas as pd
 import streamlit as st
 from google import genai
+from google.genai import types
 
 
 # =========================================================
@@ -663,6 +664,152 @@ scope_targets에는 실제 대상명만 넣는다.
 # =========================================================
 # Gemini 호출
 # =========================================================
+
+def _infer_exclusive_groups_locally(benefits):
+    """
+    동일한 제공사/유형의 단계형 금액 혜택을 가볍게 묶습니다.
+    확실하지 않은 경우에는 강제로 중복불가 처리하지 않습니다.
+    """
+    grouped = {}
+
+    for benefit in benefits:
+        issuer = str(benefit.get("issuer", "")).strip().lower()
+        category = str(benefit.get("category", "")).strip().lower()
+        name = str(benefit.get("name", "")).strip().lower()
+
+        # 금액 조건이 있고 같은 제공사/혜택 유형인 경우에만 후보 그룹
+        min_purchase = float(benefit.get("min_purchase", 0) or 0)
+        if min_purchase <= 0:
+            continue
+
+        key = (issuer, category)
+        grouped.setdefault(key, []).append(benefit)
+
+    counter = 1
+    for _, items in grouped.items():
+        if len(items) < 2:
+            continue
+
+        mins = {
+            float(item.get("min_purchase", 0) or 0)
+            for item in items
+        }
+
+        # 서로 다른 구매금액 구간이 실제로 존재할 때만 단계형으로 간주
+        if len(mins) < 2:
+            continue
+
+        group_id = f"local_tier_{counter}"
+        counter += 1
+
+        for item in items:
+            item["exclusive_group"] = group_id
+            item["exclusive_group_reason"] = (
+                "같은 제공사·혜택 유형의 금액대별 단계 혜택으로 보여 "
+                "동시에 적용되지 않는 후보로 분류했습니다."
+            )
+
+
+def finalize_first_pass_locally(first_result):
+    """
+    1차 이미지 판독 결과를 추가 Gemini 호출 없이
+    기존 앱의 최종 데이터 구조로 맞춥니다.
+    """
+    products = first_result.get("products", []) or []
+    raw_benefits = first_result.get("benefits", []) or []
+    warnings = list(first_result.get("warnings", []) or [])
+
+    benefits = []
+
+    for idx, raw in enumerate(raw_benefits, start=1):
+        scope_type = str(
+            raw.get("scope_type", "unknown")
+        ).strip() or "unknown"
+
+        scope_targets = raw.get("scope_targets", []) or []
+        confidence = str(
+            raw.get("scope_confidence", "low")
+        ).strip() or "low"
+
+        benefit = {
+            "id": f"benefit_{idx}",
+            "name": str(raw.get("name", "")).strip(),
+            "category": str(raw.get("category", "")).strip(),
+            "issuer": str(raw.get("issuer", "")).strip(),
+            "discount_type": str(
+                raw.get("discount_type", "")
+            ).strip(),
+            "value": float(raw.get("value", 0) or 0),
+            "min_purchase": float(
+                raw.get("min_purchase", 0) or 0
+            ),
+            "max_discount": float(
+                raw.get("max_discount", 0) or 0
+            ),
+            "min_purchase_basis": "target",
+            "channel": str(raw.get("channel", "")).strip(),
+            "expiry": str(raw.get("expiry", "")).strip(),
+
+            # 중복관계는 이미지에서 명시되지 않았다면
+            # 억지로 추론하지 않고 사용자 검수 대상으로 남깁니다.
+            "stack_coupon": None,
+            "stack_membership": None,
+            "stack_payment": None,
+
+            "reuse_type": "unknown",
+            "required_payment_method": str(
+                raw.get("required_payment_method", "")
+            ).strip(),
+            "excluded_items": str(
+                raw.get("excluded_items", "")
+            ).strip(),
+            "conditions": str(
+                raw.get("raw_conditions", "")
+            ).strip(),
+
+            "scope_type": scope_type,
+            "scope_targets": scope_targets,
+            "scope_confidence": confidence,
+
+            # 이전 2번 페이지와의 호환성 유지
+            "eligible_brands": (
+                scope_targets if scope_type == "brand" else []
+            ),
+            "eligible_items": (
+                scope_targets if scope_type == "product" else []
+            ),
+
+            "exclusive_group": "",
+            "exclusive_group_reason": "",
+        }
+        benefits.append(benefit)
+
+    _infer_exclusive_groups_locally(benefits)
+
+    low_scope_count = sum(
+        1
+        for benefit in benefits
+        if benefit.get("scope_type") == "unknown"
+        or benefit.get("scope_confidence") == "low"
+    )
+
+    if low_scope_count:
+        warnings.append(
+            f"혜택 {low_scope_count}개의 적용 범위가 불확실합니다. "
+            "아래 빠른 확인에서 해당 항목만 확인해주세요."
+        )
+
+    return {
+        "store_name": str(
+            first_result.get("store_name", "")
+        ).strip(),
+        "products": products,
+        "benefits": benefits,
+        "benefit_relations": [],
+        "warnings": warnings,
+    }
+
+
 def analyze_images(uploaded_files, progress_callback=None):
     client = get_gemini_client()
 
@@ -708,88 +855,52 @@ def analyze_images(uploaded_files, progress_callback=None):
     # -----------------------------------------------------
     # 1단계: 이미지에서 보이는 정보만 빠르게 추출
     # -----------------------------------------------------
-    first_input = [
-        {
-            "type": "text",
-            "text": LIGHT_EXTRACTION_PROMPT,
-        }
-    ]
-
-    for index, item in enumerate(prepared_images, start=1):
-        encoded = base64.b64encode(
-            item["bytes"]
-        ).decode("utf-8")
-
-        first_input.append(
-            {
-                "type": "text",
-                "text": f"이미지 {index}: {item['name']}",
-            }
-        )
-        first_input.append(
-            {
-                "type": "image",
-                "data": encoded,
-                "mime_type": item["mime_type"],
-            }
-        )
-
     if progress_callback:
         progress_callback(
             0.30,
-            "1/2 상품·가격·쿠폰 문구를 빠르게 읽고 있습니다..."
+            "AI가 상품·가격·쿠폰 문구를 읽고 있습니다..."
         )
 
-    first_interaction = client.interactions.create(
+    # Interactions API 대신 안정적인 generate_content 경로를 사용합니다.
+    first_contents = [LIGHT_EXTRACTION_PROMPT]
+
+    for item in prepared_images:
+        first_contents.append(
+            types.Part.from_bytes(
+                data=item["bytes"],
+                mime_type=item["mime_type"],
+            )
+        )
+
+    first_response = client.models.generate_content(
         model=EXTRACTION_MODEL,
-        input=first_input,
-        generation_config={
-            "thinking_level": "minimal",
-        },
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": LIGHT_EXTRACTION_SCHEMA,
-        },
-        store=False,
+        contents=first_contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=LIGHT_EXTRACTION_SCHEMA,
+        ),
     )
 
-    first_result = json.loads(
-        first_interaction.output_text
-    )
+    if not first_response.text:
+        raise RuntimeError(
+            "1차 이미지 분석 응답이 비어 있습니다."
+        )
+
+    first_result = json.loads(first_response.text)
 
     if progress_callback:
         progress_callback(
-            0.68,
-            "2/2 적용 범위와 중복 조건을 정리하고 있습니다..."
+            0.78,
+            "적용 범위와 기본 조건을 정리하고 있습니다..."
         )
 
     # -----------------------------------------------------
-    # 2단계: 이미지는 보내지 않고 1차 JSON만 관계 분석
+    # 2단계: Gemini를 다시 호출하지 않고 로컬에서 마무리
     # -----------------------------------------------------
-    second_interaction = client.interactions.create(
-        model=MODEL_NAME,
-        input=[
-            {
-                "type": "text",
-                "text": build_second_pass_prompt(
-                    first_result
-                ),
-            }
-        ],
-        generation_config={
-            "thinking_level": "low",
-        },
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": EXTRACTION_SCHEMA,
-        },
-        store=False,
-    )
-
-    final_result = json.loads(
-        second_interaction.output_text
+    # 무료 티어에서 연속 API 호출 시 429가 발생할 수 있어,
+    # 사진 분석은 1회만 호출하고 나머지는 앱 내부 로직으로 처리합니다.
+    final_result = finalize_first_pass_locally(
+        first_result
     )
 
     if progress_callback:
@@ -821,30 +932,25 @@ def interpret_user_condition(note, benefit_df, product_df):
             "brand": str(row.get("브랜드", "")).strip(),
         })
 
-    interaction = client.interactions.create(
+    response = client.models.generate_content(
         model=MODEL_NAME,
-        input=[
-            {
-                "type": "text",
-                "text": user_condition_prompt(
-                    note,
-                    benefit_names,
-                    products_context,
-                ),
-            }
-        ],
-        generation_config={
-            "thinking_level": "low",
-        },
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": USER_CONDITION_SCHEMA,
-        },
-        store=False,
+        contents=user_condition_prompt(
+            note,
+            benefit_names,
+            products_context,
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=USER_CONDITION_SCHEMA,
+        ),
     )
 
-    return json.loads(interaction.output_text)
+    if not response.text:
+        raise RuntimeError(
+            "추가 조건 해석 응답이 비어 있습니다."
+        )
+
+    return json.loads(response.text)
 
 
 def stack_code_to_label(value):
@@ -1211,13 +1317,19 @@ if st.button(
 
             if "429" in message or "RESOURCE_EXHAUSTED" in message:
                 st.error(
-                    "Gemini API 사용 한도에 도달했습니다. "
+                    "Gemini API 요청이 일시적으로 제한되었습니다. "
+                    "현재 버전은 분석 1회당 Gemini를 한 번만 호출합니다. "
                     "잠시 후 다시 시도해주세요."
                 )
             elif "API_KEY" in message or "401" in message or "403" in message:
                 st.error(
                     "Gemini API 키를 확인해주세요. "
                     "Streamlit Secrets의 GEMINI_API_KEY 값이 올바른지 확인하면 됩니다."
+                )
+            elif "404" in message or "not found" in message.lower():
+                st.error(
+                    "현재 프로젝트에서 해당 Gemini 모델을 사용할 수 없습니다. "
+                    "오류 상세의 모델명을 확인해주세요."
                 )
             else:
                 st.error(
