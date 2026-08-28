@@ -10,22 +10,21 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("⚠️ 예상치 못한 일이 생겨도 괜찮을까?")
+st.title("⚠️ 이 구매 후, 내 금융 여유는 얼마나 버틸까?")
 
 st.write(
-    "앞에서 계산한 구매 후 남는 돈을 기준으로, "
-    "갑작스러운 지출이나 이번 달 가용금액 감소가 생겼을 때 "
-    "얼마나 여유가 남는지 확인합니다."
+    "3번에서 확인한 **구매 후 남는 돈**을 기준으로, "
+    "예상치 못한 상황이 생겼을 때 내 금융 여유가 얼마나 빠르게 줄어드는지 확인합니다."
 )
 
 st.info(
-    "이 테스트는 미래를 예측하는 기능이 아니라, "
-    "현재 소비 결정이 예상치 못한 상황에 얼마나 취약한지 확인하는 간단한 시뮬레이션입니다."
+    "스트레스 지수는 미래를 예측하는 점수가 아니라, "
+    "**선택한 충격이 구매 후 여유자금의 몇 %를 소진하는지** 보여주는 MVP 지표입니다."
 )
 
 
 # =========================================================
-# 1. 3번 페이지 데이터 불러오기
+# 데이터 불러오기
 # =========================================================
 monthly_finance = st.session_state.get("monthly_finance", {})
 
@@ -47,16 +46,13 @@ purchase_price = int(
 available_before_purchase = st.session_state.get(
     "finance_available_before_purchase"
 )
-
 available_after_purchase = st.session_state.get(
     "finance_available_after_purchase"
 )
 
 if available_before_purchase is None and usable_money > 0:
     available_before_purchase = (
-        usable_money
-        - spent_so_far
-        - essential_remaining
+        usable_money - spent_so_far - essential_remaining
     )
 
 if (
@@ -65,8 +61,7 @@ if (
     and purchase_price > 0
 ):
     available_after_purchase = (
-        available_before_purchase
-        - purchase_price
+        available_before_purchase - purchase_price
     )
 
 
@@ -74,16 +69,43 @@ def money(value):
     return f"{int(round(value)):,}원"
 
 
+def stress_index(shock, base):
+    if base <= 0:
+        return 100.0 if shock > 0 else 0.0
+    return (shock / base) * 100
+
+
+def stress_level(index):
+    if index < 30:
+        return "🟢", "여유 있음"
+    if index < 60:
+        return "🟡", "부담 증가"
+    if index < 90:
+        return "🟠", "취약"
+    if index <= 100:
+        return "🔴", "매우 취약"
+    return "🚨", "자금 부족"
+
+
 def money_options(min_value, max_value, step=10_000):
-    values = list(range(int(min_value), int(max_value) + 1, int(step)))
+    min_value = int(min_value)
+    max_value = int(max_value)
+    step = int(step)
+
+    values = list(range(min_value, max_value + 1, step))
     if not values:
-        values = [int(min_value)]
-    return values
+        values = [min_value]
+
+    if values[-1] < max_value:
+        values.append(max_value)
+
+    return sorted(set(values))
 
 
-def money_select_slider(label, min_value, max_value, value, step=10_000, help=None):
+def money_slider(label, min_value, max_value, value, step=10_000, help=None):
     options = money_options(min_value, max_value, step)
     nearest = min(options, key=lambda x: abs(x - int(value)))
+
     return st.select_slider(
         label,
         options=options,
@@ -93,10 +115,10 @@ def money_select_slider(label, min_value, max_value, value, step=10_000, help=No
     )
 
 
-# 3번 소비 판단을 완료했는지 새 구조 기준으로 확인
 analysis_ready = (
     isinstance(monthly_finance, dict)
     and usable_money > 0
+    and available_before_purchase is not None
     and available_after_purchase is not None
     and purchase_price > 0
 )
@@ -110,47 +132,87 @@ if not analysis_ready:
 
 
 # =========================================================
-# 2. 현재 상태
+# 1. 구매 후 금융 여유
 # =========================================================
-st.header("1️⃣ 현재 상태")
+st.header("1️⃣ 구매 후 금융 여유")
 
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    st.metric(
-        "이번 구매",
-        money(purchase_price),
-    )
+    st.metric("이번 구매", money(purchase_price))
 
 with c2:
-    st.metric(
-        "구매 전 자유자금",
-        money(available_before_purchase),
-    )
+    st.metric("구매 전 자유자금", money(available_before_purchase))
 
 with c3:
-    st.metric(
-        "구매 후 남는 돈",
-        money(available_after_purchase),
-    )
+    st.metric("구매 후 남는 돈", money(available_after_purchase))
 
-if available_after_purchase < 0:
+if available_after_purchase <= 0:
     st.error(
-        "현재 입력값 기준으로는 이미 구매 후 잔액이 부족합니다. "
-        "스트레스 테스트보다 구매 규모 조정이 우선입니다."
+        "현재 구매만으로도 이번 달 자유자금이 모두 소진됩니다. "
+        "추가 충격을 감당할 여유가 없습니다."
     )
     st.stop()
+
+st.success(
+    f"🛡️ 현재 구매 후 **최대 {money(available_after_purchase)}까지의 추가 충격**을 "
+    "잔액 부족 없이 흡수할 수 있습니다."
+)
 
 st.divider()
 
 
 # =========================================================
-# 3. 스트레스 상황 선택
+# 2. 기본 충격 시나리오 한눈에 보기
 # =========================================================
-st.header("2️⃣ 만약 이런 일이 생긴다면?")
+st.header("2️⃣ 어느 정도 충격부터 위험해질까?")
+
+st.caption(
+    "아래는 구매 후 남는 돈을 기준으로 한 간단한 충격 시나리오입니다."
+)
+
+# 사용자의 구매 후 잔액에 비례한 3단계 시나리오.
+# 10,000원 단위로 반올림하되 최소 10,000원.
+scenario_amounts = []
+for ratio in (0.25, 0.60, 1.20):
+    amount = max(
+        10_000,
+        int(round((available_after_purchase * ratio) / 10_000) * 10_000),
+    )
+    scenario_amounts.append(amount)
+
+scenario_amounts = sorted(set(scenario_amounts))
+
+cols = st.columns(len(scenario_amounts))
+
+for col, shock in zip(cols, scenario_amounts):
+    idx = stress_index(shock, available_after_purchase)
+    icon, label = stress_level(idx)
+    remaining = available_after_purchase - shock
+
+    with col:
+        st.markdown(f"**충격 {money(shock)}**")
+        st.metric(
+            "충격 후 잔액",
+            money(remaining),
+        )
+        st.write(f"{icon} **{label} · {idx:.1f}%**")
+
+st.caption(
+    "※ 위 금액은 개인별 구매 후 여유자금에 비례해 보여주는 예시이며, "
+    "특정 미래 상황을 예측한 값은 아닙니다."
+)
+
+st.divider()
+
+
+# =========================================================
+# 3. 직접 스트레스 테스트
+# =========================================================
+st.header("3️⃣ 내 상황으로 테스트하기")
 
 stress_scenario = st.radio(
-    "테스트할 상황을 선택해주세요.",
+    "어떤 상황을 가정할까요?",
     [
         "💸 갑작스러운 지출",
         "📉 이번 달 쓸 수 있는 돈 감소",
@@ -162,41 +224,43 @@ stress_scenario = st.radio(
 income_drop = 0
 unexpected_expense = 0
 
+max_money_shock = max(
+    500_000,
+    usable_money,
+    available_after_purchase * 2,
+)
 
 if stress_scenario == "💸 갑작스러운 지출":
-    unexpected_expense = money_select_slider(
-        "예상치 못한 지출이 얼마나 생긴다고 가정할까요?",
+    unexpected_expense = money_slider(
+        "예상치 못한 지출",
         min_value=10_000,
-        max_value=max(500_000, usable_money),
-        value=min(100_000, max(10_000, usable_money)),
+        max_value=max_money_shock,
+        value=min(100_000, max_money_shock),
         step=10_000,
-        help="예: 병원비, 수리비, 교통비, 갑작스러운 모임비 등",
+        help="예: 병원비, 수리비, 갑작스러운 교통비나 생활비 등",
     )
 
 elif stress_scenario == "📉 이번 달 쓸 수 있는 돈 감소":
     drop_rate = st.slider(
-        "이번 달 쓸 수 있는 돈이 얼마나 줄어든다고 가정할까요?",
+        "이번 달 쓸 수 있는 돈 감소율",
         min_value=5,
         max_value=100,
         value=20,
         step=5,
         format="%d%%",
-        help="월급·용돈·생활비 등 이번 달 실제 가용금액이 예상보다 줄어드는 상황입니다.",
+        help="이번 달 실제 사용할 수 있는 돈이 예상보다 줄어드는 상황입니다.",
     )
 
-    income_drop = round(
-        usable_money * drop_rate / 100
-    )
+    income_drop = round(usable_money * drop_rate / 100)
 
     st.caption(
-        f"현재 입력한 {money(usable_money)}에서 "
-        f"약 **{money(income_drop)}** 감소하는 상황입니다."
+        f"가용금액이 **{money(income_drop)} 감소**하는 상황입니다."
     )
 
 else:
-    col_a, col_b = st.columns(2)
+    left, right = st.columns(2)
 
-    with col_a:
+    with left:
         drop_rate = st.slider(
             "가용금액 감소율",
             min_value=5,
@@ -205,21 +269,15 @@ else:
             step=5,
             format="%d%%",
         )
+        income_drop = round(usable_money * drop_rate / 100)
+        st.caption(f"가용금액 **-{money(income_drop)}**")
 
-        income_drop = round(
-            usable_money * drop_rate / 100
-        )
-
-        st.caption(
-            f"가용금액 **-{money(income_drop)}**"
-        )
-
-    with col_b:
-        unexpected_expense = money_select_slider(
+    with right:
+        unexpected_expense = money_slider(
             "추가 지출",
             min_value=10_000,
-            max_value=max(500_000, usable_money),
-            value=min(100_000, max(10_000, usable_money)),
+            max_value=max_money_shock,
+            value=min(100_000, max_money_shock),
             step=10_000,
         )
 
@@ -233,162 +291,195 @@ run_test = st.button(
 
 
 # =========================================================
-# 4. 테스트 계산
+# 4. 결과
 # =========================================================
 if run_test:
-    # 구매를 이미 실행한 상태를 기준으로 충격을 추가 적용
+    total_shock = income_drop + unexpected_expense
+
     stressed_balance = (
-        available_after_purchase
-        - income_drop
-        - unexpected_expense
+        available_after_purchase - total_shock
     )
 
-    # 구매하지 않았다면 같은 충격에서 얼마나 남는지
     balance_without_purchase = (
-        available_before_purchase
-        - income_drop
-        - unexpected_expense
+        available_before_purchase - total_shock
     )
+
+    after_index = stress_index(
+        total_shock,
+        available_after_purchase,
+    )
+
+    before_index = stress_index(
+        total_shock,
+        available_before_purchase,
+    )
+
+    after_icon, after_label = stress_level(after_index)
+    before_icon, before_label = stress_level(before_index)
+
+    index_change = after_index - before_index
 
     st.divider()
-    st.header("3️⃣ 결과")
+    st.header("4️⃣ 스트레스 결과")
 
-    if stressed_balance >= 0:
-        st.success(
-            f"🟢 **이 상황은 감당 가능합니다.**\n\n"
-            f"충격이 발생해도 **{money(stressed_balance)}**이 남습니다."
+    # -----------------------------------------------------
+    # 핵심 스트레스 지수
+    # -----------------------------------------------------
+    st.markdown(
+        f"## {after_icon} 스트레스 지수 **{after_index:.1f}% · {after_label}**"
+    )
+
+    if after_index <= 100:
+        st.write(
+            f"선택한 충격 **{money(total_shock)}**이 "
+            f"구매 후 여유자금 **{money(available_after_purchase)}의 "
+            f"{after_index:.1f}%**를 소진합니다."
         )
     else:
-        shortage = abs(stressed_balance)
-
-        st.error(
-            f"🔴 **이 상황에서는 자금이 부족합니다.**\n\n"
-            f"현재 소비 후 같은 상황이 발생하면 "
-            f"**{money(shortage)} 부족**합니다."
+        st.write(
+            f"선택한 충격 **{money(total_shock)}**이 구매 후 여유자금을 초과합니다."
         )
 
-    # =====================================================
-    # 5. 충격 전후 흐름
-    # =====================================================
-    st.subheader("💥 돈의 흐름")
+    progress_value = min(after_index / 100, 1.0)
+    st.progress(progress_value)
 
-    m1, m2, m3, m4 = st.columns(4)
+    if stressed_balance < 0:
+        st.error(
+            f"🚨 충격 후 **{money(abs(stressed_balance))}이 부족**합니다."
+        )
+    elif after_index >= 90:
+        st.error(
+            f"🔴 잔액은 플러스지만 **{money(stressed_balance)}만 남아 "
+            "충격 흡수 여유가 거의 없습니다.**"
+        )
+    elif after_index >= 60:
+        st.warning(
+            f"🟠 충격 후 **{money(stressed_balance)}이 남지만 "
+            "금융 여유가 크게 줄어듭니다.**"
+        )
+    elif after_index >= 30:
+        st.warning(
+            f"🟡 충격 후 **{money(stressed_balance)}이 남습니다.** "
+            "현재보다 부담이 커지는 상황입니다."
+        )
+    else:
+        st.success(
+            f"🟢 충격 후에도 **{money(stressed_balance)}이 남아 "
+            "상대적으로 여유가 있습니다.**"
+        )
 
-    with m1:
+    # -----------------------------------------------------
+    # 돈의 흐름
+    # -----------------------------------------------------
+    st.subheader("💥 충격이 오면 돈은 이렇게 변합니다")
+
+    flow1, flow2, flow3 = st.columns(3)
+
+    with flow1:
         st.metric(
-            "구매 후",
+            "구매 후 여유자금",
             money(available_after_purchase),
         )
 
-    with m2:
+    with flow2:
         st.metric(
-            "가용금액 감소",
-            f"-{money(income_drop)}",
+            "선택한 충격",
+            f"-{money(total_shock)}",
         )
 
-    with m3:
-        st.metric(
-            "추가 지출",
-            f"-{money(unexpected_expense)}",
-        )
-
-    with m4:
+    with flow3:
         st.metric(
             "충격 후",
             money(stressed_balance),
         )
 
-    # =====================================================
-    # 6. 한 줄 해석
-    # =====================================================
-    total_shock = income_drop + unexpected_expense
+    st.write(
+        f"**{money(available_after_purchase)} → "
+        f"-{money(total_shock)} → {money(stressed_balance)}**"
+    )
 
-    if available_after_purchase > 0:
-        shock_ratio = (
-            total_shock / available_after_purchase * 100
-        )
-    else:
-        shock_ratio = 0
-
-    if stressed_balance >= 0:
-        st.caption(
-            f"이번 충격은 구매 후 남아 있던 돈의 "
-            f"**{shock_ratio:.1f}%**를 사용합니다."
-        )
-    else:
-        st.caption(
-            "구매 후 남는 돈보다 충격 규모가 더 커서 "
-            "현재 월간 자금 범위를 벗어납니다."
-        )
-
-    # =====================================================
-    # 7. 이 구매가 없었다면?
-    # =====================================================
-    st.subheader("🧮 이 구매가 없었다면?")
+    # -----------------------------------------------------
+    # 구매 전후 스트레스 비교
+    # -----------------------------------------------------
+    st.subheader("🧮 이 구매가 금융 스트레스에 미친 영향")
 
     compare1, compare2 = st.columns(2)
 
     with compare1:
+        st.markdown("**이 구매가 없었다면**")
         st.metric(
-            "구매하지 않았을 경우",
+            "충격 후 남는 돈",
             money(balance_without_purchase),
+        )
+        st.write(
+            f"{before_icon} 스트레스 지수 "
+            f"**{before_index:.1f}% · {before_label}**"
         )
 
     with compare2:
+        st.markdown("**이번 구매를 한다면**")
         st.metric(
-            "현재 구매 후",
+            "충격 후 남는 돈",
             money(stressed_balance),
-            delta=f"-{money(purchase_price)}",
-            delta_color="inverse",
+        )
+        st.write(
+            f"{after_icon} 스트레스 지수 "
+            f"**{after_index:.1f}% · {after_label}**"
         )
 
-    if balance_without_purchase >= 0 and stressed_balance < 0:
+    if index_change > 0:
         st.warning(
-            "이 충격 자체는 원래 감당 가능하지만, "
-            "이번 구매 이후에는 자금이 부족해집니다."
-        )
-    elif stressed_balance >= 0:
-        st.write(
-            f"이번 구매 때문에 같은 스트레스 상황에서 사용할 수 있는 여유자금이 "
-            f"**{money(purchase_price)}** 줄어듭니다."
+            f"이번 구매로 같은 충격에 대한 스트레스 지수가 "
+            f"**{index_change:.1f}%p 증가**합니다."
         )
     else:
-        st.write(
-            "구매 여부와 관계없이 현재 설정한 충격이 큰 편입니다. "
-            "다만 구매를 하지 않았을 때보다 부족 폭은 줄어듭니다."
+        st.info(
+            "현재 설정에서는 구매 전후 스트레스 지수 차이가 없습니다."
         )
 
-    # =====================================================
-    # 8. 다음 판단을 위한 요약
-    # =====================================================
+    # -----------------------------------------------------
+    # 핵심 결론
+    # -----------------------------------------------------
     st.subheader("🔎 한눈에 보기")
 
-    if stressed_balance >= 0:
+    if stressed_balance < 0:
         st.write(
-            f"현재 구매 후 **{stress_scenario}** 상황이 발생해도 "
-            f"**{money(stressed_balance)}**이 남습니다."
+            f"이번 구매 후 **{stress_scenario}** 상황이 발생하면 "
+            f"**{money(abs(stressed_balance))}이 부족**합니다. "
+            "현재 구매가 예상치 못한 상황에 대응할 여유를 크게 줄입니다."
+        )
+    elif after_index >= 90:
+        st.write(
+            f"자금 부족까지는 아니지만 충격 후 **{money(stressed_balance)}만 남습니다.** "
+            "현재 구매 후 금융 여유가 매우 취약한 상태입니다."
+        )
+    elif after_index >= 60:
+        st.write(
+            f"충격 후 **{money(stressed_balance)}이 남지만**, "
+            "구매 후 여유자금의 상당 부분이 소진됩니다."
         )
     else:
         st.write(
-            f"현재 구매 후 **{stress_scenario}** 상황이 발생하면 "
-            f"**{money(abs(stressed_balance))}**이 부족합니다."
+            f"현재 설정한 충격 이후에도 **{money(stressed_balance)}이 남습니다.** "
+            "다만 충격 규모를 바꿔 어느 수준부터 취약해지는지 함께 확인해보세요."
         )
 
-    # =====================================================
-    # 9. 결과 저장
-    # =====================================================
+    # -----------------------------------------------------
+    # 결과 저장
+    # -----------------------------------------------------
     st.session_state["stress_scenario"] = stress_scenario
+    st.session_state["stress_total_shock"] = total_shock
     st.session_state["stress_income_drop"] = income_drop
     st.session_state["stress_unexpected_expense"] = unexpected_expense
     st.session_state["stress_balance"] = stressed_balance
-    st.session_state["stress_status"] = (
-        "감당 가능"
-        if stressed_balance >= 0
-        else "자금 부족"
-    )
-    st.session_state["stress_status_code"] = (
-        "safe"
-        if stressed_balance >= 0
-        else "danger"
-    )
+    st.session_state["stress_index"] = after_index
+    st.session_state["stress_index_before_purchase"] = before_index
+    st.session_state["stress_index_change"] = index_change
+    st.session_state["stress_status"] = after_label
     st.session_state["stress_test_completed"] = True
+
+    st.caption(
+        "※ 스트레스 지수는 공인 신용평가·재무건전성 지표가 아닙니다. "
+        "선택한 충격 ÷ 해당 시점의 자유자금 × 100으로 계산한 "
+        "소비 의사결정 보조용 지표입니다."
+    )
