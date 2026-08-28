@@ -33,7 +33,7 @@ st.info(
 # =========================================================
 # 설정
 # =========================================================
-MODEL_NAME = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-3.7-flash"
 MAX_IMAGES = 6
 MAX_INLINE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_SIDE = 1600
