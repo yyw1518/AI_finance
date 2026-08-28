@@ -74,6 +74,25 @@ def money(value):
     return f"{int(round(value)):,}원"
 
 
+def money_options(min_value, max_value, step=10_000):
+    values = list(range(int(min_value), int(max_value) + 1, int(step)))
+    if not values:
+        values = [int(min_value)]
+    return values
+
+
+def money_select_slider(label, min_value, max_value, value, step=10_000, help=None):
+    options = money_options(min_value, max_value, step)
+    nearest = min(options, key=lambda x: abs(x - int(value)))
+    return st.select_slider(
+        label,
+        options=options,
+        value=nearest,
+        format_func=lambda x: f"{x:,}원",
+        help=help,
+    )
+
+
 # 3번 소비 판단을 완료했는지 새 구조 기준으로 확인
 analysis_ready = (
     isinstance(monthly_finance, dict)
@@ -145,7 +164,7 @@ unexpected_expense = 0
 
 
 if stress_scenario == "💸 갑작스러운 지출":
-    unexpected_expense = st.slider(
+    unexpected_expense = money_select_slider(
         "예상치 못한 지출이 얼마나 생긴다고 가정할까요?",
         min_value=10_000,
         max_value=max(500_000, usable_money),
@@ -196,7 +215,7 @@ else:
         )
 
     with col_b:
-        unexpected_expense = st.slider(
+        unexpected_expense = money_select_slider(
             "추가 지출",
             min_value=10_000,
             max_value=max(500_000, usable_money),
