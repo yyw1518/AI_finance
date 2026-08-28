@@ -651,10 +651,20 @@ benefit_count = len(benefits)
 
 
 # =========================================================
+# 자동 판단 정책
+# =========================================================
+# 1. 사용자 직접 확인 > AI의 명시적 관계 판단 > 구조화된 명시 조건 순으로 신뢰합니다.
+# 2. unknown을 임의로 possible/not_possible로 확정하지 않습니다.
+# 3. 서로 다른 필수 결제수단, 동일 exclusive_group 등 논리적으로 명확한 경우만 자동 제외합니다.
+# 4. 불확실성은 기본적으로 보수적으로 유지합니다.
+# 5. 사용자 질문은 현재 최적 결과를 실제로 바꿀 수 있을 때만 최대 1개 노출합니다.
+
+
+# =========================================================
 # 혜택 간 중복 가능 여부
 # =========================================================
-PAYMENT_METHODS = {"card", "easy_pay"}
-PAYMENT_RELATED = {"card", "easy_pay", "point"}
+PAYMENT_METHODS = {"card", "easy_pay", "payment"}
+PAYMENT_RELATED = {"card", "easy_pay", "payment", "point"}
 
 
 def relation_key(a, b):
@@ -697,6 +707,17 @@ def pair_compatibility(a, b):
 
     ca = normalize_category(a)
     cb = normalize_category(b)
+
+    # 특정 플랫폼명을 하드코딩하지 않고, 명시된 결제수단 문자열 자체를 비교합니다.
+    required_a = str(a.get("required_payment_method", "")).strip()
+    required_b = str(b.get("required_payment_method", "")).strip()
+
+    if (
+        required_a
+        and required_b
+        and required_a.lower() != required_b.lower()
+    ):
+        return "invalid"
 
     # 실제 결제수단은 한 결제건에서 하나
     if ca in PAYMENT_METHODS and cb in PAYMENT_METHODS:
@@ -842,14 +863,18 @@ def individual_benefit_check(benefit):
         reasons.append(f"{name}: 혜택 금액을 확인해주세요.")
 
     required_payment = str(benefit.get("required_payment_method", "")).strip()
-    if required_payment:
-        status = "uncertain"
-        reasons.append(f"{name}: {required_payment} 결제 조건을 확인해주세요.")
+    # required_payment_method가 있으면 '불확실성'이 아니라 명시 조건으로 취급합니다.
+    # 실제 추천 문구에서 해당 결제수단을 안내하면 되므로 사용자에게 재확인하지 않습니다.
 
     excluded_items = str(benefit.get("excluded_items", "")).strip()
     if excluded_items:
+        # 제외상품 문구는 단순 문자열 유사도만으로 자동 확정하지 않습니다.
+        # 실제 적용 대상(scope)에서 명확히 제외된 정보가 구조화되어 있지 않다면
+        # 내부 불확실성으로만 남기고, 최적 결과를 바꾸는 경우에만 질문 후보가 됩니다.
         status = "uncertain"
-        reasons.append(f"{name}: 제외 상품 여부를 확인해주세요.")
+        reasons.append(
+            f"{name}: 제외 상품 조건이 있어 보수적으로 처리했습니다."
+        )
 
     # 중복 정보가 불명확한 경우는 조합 단계에서 한 번만 표시
     return status, reasons
@@ -1488,11 +1513,11 @@ unknown_scope_benefits = [
 
 if unknown_scope_benefits:
     with st.expander(
-        f"⚠️ 적용 범위를 확인하지 못한 혜택 {len(unknown_scope_benefits)}개"
+        f"AI가 보수적으로 처리한 적용 범위 {len(unknown_scope_benefits)}개"
     ):
         st.caption(
-            "이 혜택들은 적용 대상을 확정할 수 없어 최적화에서 보수적으로 처리했습니다. "
-            "필요하면 아래 '실제 조건과 다른 부분 수정'에서 자연어로 알려주세요."
+            "적용 대상을 확정하기 어려운 혜택은 자동으로 보수적으로 처리했습니다. "
+            "추천 결과가 실제 조건과 다를 때만 수정하시면 됩니다."
         )
         for benefit in unknown_scope_benefits[:5]:
             st.write(f"- {benefit.get('name', '혜택')}")
@@ -1662,25 +1687,57 @@ if len(best_option["choices"]) > 1:
 
 
 # =========================================================
-# 3. 정말 필요한 경우에만 한 번 확인
+# 3. 결과를 실제로 바꿀 수 있는 조건만 최대 1개 확인
 # =========================================================
+best_confirmed_option = ranked_confirmed[0] if ranked_confirmed else None
+
+decision_gain = 0
+if best_confirmed_option is not None:
+    decision_gain = max(
+        0,
+        round(
+            best_confirmed_option["effective_cost"]
+            - best_option["effective_cost"]
+        ),
+    )
+
 pair_questions = []
 seen_pair_keys = set()
 
-for pair in best_option.get("uncertain_pairs", []):
-    key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
-    if key and key not in seen_pair_keys:
-        seen_pair_keys.add(key)
-        pair_questions.append(pair)
+# 현재 1위안이 불확실하고, 그 불확실성을 허용했을 때 실제로 더 이득인 경우에만 질문 후보 생성
+if (
+    best_option.get("uncertain_count", 0) > 0
+    and decision_gain > 0
+):
+    for pair in best_option.get("uncertain_pairs", []):
+        key = "||".join(
+            sorted([
+                str(pair["a_id"]),
+                str(pair["b_id"]),
+            ])
+        )
+        if key and key not in seen_pair_keys:
+            seen_pair_keys.add(key)
+            pair_questions.append(pair)
 
-# AI도 판단하지 못했고, 현재 최적안에 실제 포함된 관계만 최대 1개 질문
+critical_question_shown = False
+
+# 질문은 최대 1개만 노출
 if pair_questions:
     pair = pair_questions[0]
-    key = "||".join(sorted([str(pair["a_id"]), str(pair["b_id"])]))
-    current_value = st.session_state.get("benefit_relations", {}).get(key)
+    key = "||".join(
+        sorted([
+            str(pair["a_id"]),
+            str(pair["b_id"]),
+        ])
+    )
+    current_value = st.session_state.get(
+        "benefit_relations",
+        {},
+    ).get(key)
 
     st.warning(
-        "⚠️ 최적 결제금액을 확정하려면 딱 한 가지 확인이 필요합니다."
+        f"⚠️ 이 조건 하나에 따라 최대 {money(decision_gain)} 차이가 날 수 있어 확인이 필요합니다."
     )
 
     answer = st.radio(
@@ -1690,6 +1747,8 @@ if pair_questions:
         key=f"critical_relation_{key}",
     )
 
+    critical_question_shown = True
+
     new_value = None
     if answer == "중복 가능":
         new_value = "possible"
@@ -1697,34 +1756,51 @@ if pair_questions:
         new_value = "not_possible"
 
     if new_value is not None and new_value != current_value:
-        relations = st.session_state.get("benefit_relations", {}).copy()
+        relations = st.session_state.get(
+            "benefit_relations",
+            {},
+        ).copy()
         relations[key] = new_value
         st.session_state["benefit_relations"] = relations
-        st.success("확인 결과를 반영해 최적 결제 방법을 다시 계산합니다.")
         st.rerun()
 
     if answer == "잘 모르겠어요":
+        if best_confirmed_option is not None:
+            st.caption(
+                f"몰라도 괜찮습니다. 확실한 조건만 사용하면 "
+                f"**{money(best_confirmed_option['payment_price'])}**에 결제할 수 있습니다."
+            )
+        else:
+            st.caption(
+                "몰라도 괜찮습니다. 불확실한 혜택은 보수적으로 제외하고 판단합니다."
+            )
+
+# 관계 질문이 없거나 결과 차이가 없다면 확인사항을 사용자에게 쏟아내지 않음
+if not critical_question_shown:
+    if best_option.get("uncertain_count", 0) == 0:
+        st.success("✅ 현재 입력 정보 기준으로 바로 적용 가능한 결제안입니다.")
+    elif decision_gain <= 0:
+        st.success(
+            "✅ 일부 세부 조건이 불확실하지만 최적 결제 결과에는 영향을 주지 않습니다."
+        )
+    else:
         st.caption(
-            "확인하지 않아도 됩니다. 아래의 조건 확인 없이 선택 가능한 대안을 이용할 수 있습니다."
+            "AI가 세부 조건을 보수적으로 반영했습니다. "
+            "결과를 바꿀 정도로 중요한 확인사항은 없습니다."
         )
 
-# =========================================================
-# 4. 그 밖의 확인할 조건
-# =========================================================
-if best_option["uncertain_count"] > 0:
-    reasons = unique_text(best_option["uncertain_reasons"])
+# 세부 불확실성은 기본 화면에 나열하지 않고, 필요할 때만 확인할 수 있게 숨김
+all_uncertain_reasons = unique_text(
+    best_option.get("uncertain_reasons", [])
+)
 
-    st.warning("⚠️ 결제 전 확인이 필요한 조건이 있습니다.")
-
-    for reason in reasons[:2]:
-        st.write(f"- {reason}")
-
-    if len(reasons) > 2:
-        with st.expander(f"추가 확인사항 {len(reasons) - 2}개"):
-            for reason in reasons[2:]:
-                st.write(f"- {reason}")
-else:
-    st.success("✅ 현재 입력 정보 기준으로 바로 적용 가능한 결제안입니다.")
+if all_uncertain_reasons:
+    with st.expander("AI가 보수적으로 처리한 세부 조건 보기"):
+        st.caption(
+            "아래 항목은 참고용입니다. 현재 추천을 사용하기 위해 모두 확인할 필요는 없습니다."
+        )
+        for reason in all_uncertain_reasons[:8]:
+            st.write(f"- {reason}")
 
 
 # =========================================================
