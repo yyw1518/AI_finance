@@ -359,7 +359,24 @@ def percent(value):
 
 
 def normalize_category(benefit):
-    return benefit.get("category", "other")
+    raw = str(benefit.get("category", "other") or "other").strip().lower()
+    aliases = {
+        "쿠폰": "coupon",
+        "coupon": "coupon",
+        "결제": "payment",
+        "결제혜택": "payment",
+        "payment": "payment",
+        "간편결제": "payment",
+        "포인트": "payment",
+        "points": "payment",
+        "멤버십": "membership",
+        "membership": "membership",
+        "배송": "shipping",
+        "shipping": "shipping",
+        "기타": "other",
+        "other": "other",
+    }
+    return aliases.get(raw, raw or "other")
 
 
 def relation_value(value):
