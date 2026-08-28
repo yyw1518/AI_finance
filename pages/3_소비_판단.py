@@ -260,6 +260,37 @@ default_essential = int(month_data.get("essential_remaining", 0) or 0)
 
 
 # =========================================================
+# 심사용 데모 금융정보 자동 입력
+# =========================================================
+if st.session_state.get("demo_mode", False):
+
+    demo_finance = st.session_state.get(
+        "demo_finance",
+        {}
+    )
+
+    default_usable = int(
+        demo_finance.get(
+            "usable_money",
+            700000
+        )
+    )
+
+    default_spent = int(
+        demo_finance.get(
+            "spent_so_far",
+            300000
+        )
+    )
+
+    default_essential = int(
+        demo_finance.get(
+            "essential_remaining",
+            200000
+        )
+    )
+
+# =========================================================
 # 화면
 # =========================================================
 st.title("💰 이 소비, 지금 해도 괜찮을까?")
