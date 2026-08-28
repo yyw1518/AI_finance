@@ -408,11 +408,22 @@ with c2:
 # =========================================================
 st.write("")
 
-analyze = st.button(
-    "✨ 저장하고 이 소비 분석하기",
-    type="primary",
-    use_container_width=True,
-)
+if st.session_state.get("demo_mode", False):
+
+    st.info(
+        "🧪 심사용 샘플 금융정보를 기준으로 "
+        "소비 판단 결과를 자동 계산합니다."
+    )
+
+    analyze = True
+
+else:
+
+    analyze = st.button(
+        "✨ 저장하고 이 소비 분석하기",
+        type="primary",
+        use_container_width=True,
+    )
 
 if analyze:
     data = {
@@ -421,8 +432,20 @@ if analyze:
         "essential_remaining": essential_remaining,
     }
 
-    save_mode = save_monthly_data(data)
+ if st.session_state.get("demo_mode", False):
 
+    save_mode = "demo"
+
+else:
+
+if st.session_state.get("demo_mode", False):
+
+    save_mode = "demo"
+
+else:
+
+    save_mode = save_monthly_data(data)
+    
     # 같은 세션에서도 즉시 재사용
     st.session_state["monthly_finance"] = {
         "year_month": CURRENT_MONTH,
@@ -509,17 +532,26 @@ if analyze:
                 "혜택을 확보하면서 구매할 수 있습니다."
             )
 
-    if save_mode == "supabase":
-        st.caption(
-            f"💾 {CURRENT_MONTH_LABEL} 입력값이 저장되었습니다. "
-            "이번 달에 다시 방문하면 자동으로 불러옵니다."
-        )
-    else:
-        st.caption(
-            f"💾 {CURRENT_MONTH_LABEL} 입력값을 저장했습니다. "
-            "현재 MVP 환경에서는 앱 서버가 재배포되면 로컬 저장값이 초기화될 수 있습니다."
-        )
+    if save_mode == "demo":
 
+    st.caption(
+        "🧪 현재 결과는 심사용 샘플 금융정보를 이용한 결과입니다."
+    )
+
+    elif save_mode == "supabase":
+
+    st.caption(
+        f"💾 {CURRENT_MONTH_LABEL} 입력값이 저장되었습니다. "
+        "이번 달에 다시 방문하면 자동으로 불러옵니다."
+    )
+
+    else:
+
+    st.caption(
+        f"💾 {CURRENT_MONTH_LABEL} 입력값을 저장했습니다. "
+        "현재 MVP 환경에서는 앱 서버가 재배포되면 "
+        "로컬 저장값이 초기화될 수 있습니다."
+    )
     # 4번 페이지에서 그대로 사용
     st.session_state["finance_available_before_purchase"] = available_before
     st.session_state["finance_available_after_purchase"] = available_after
