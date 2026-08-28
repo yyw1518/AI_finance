@@ -34,8 +34,8 @@ st.info(
 # =========================================================
 # 설정
 # =========================================================
-MODEL_NAME = "gemini-3.7-flash"
-EXTRACTION_MODEL = "gemini-3.5-flash-lite"
+MODEL_NAME = "gemini-3.6-flash"
+EXTRACTION_MODEL = "gemini-3.6-flash"
 MAX_IMAGES = 6
 MAX_INLINE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_SIDE = 1600
@@ -858,7 +858,7 @@ def analyze_images(uploaded_files, progress_callback=None):
     if progress_callback:
         progress_callback(
             0.30,
-            "AI가 상품·가격·쿠폰 문구를 읽고 있습니다..."
+            "Gemini가 상품·가격·쿠폰 문구를 분석하고 있습니다..."
         )
 
     # Interactions API 대신 안정적인 generate_content 경로를 사용합니다.
@@ -1315,26 +1315,30 @@ if st.button(
             message = str(error)
             progress_text.caption("분석을 완료하지 못했습니다.")
 
-            if "429" in message or "RESOURCE_EXHAUSTED" in message:
+            lowered = message.lower()
+
+            if "429" in message or "resource_exhausted" in lowered:
                 st.error(
                     "Gemini API 요청이 일시적으로 제한되었습니다. "
-                    "현재 버전은 분석 1회당 Gemini를 한 번만 호출합니다. "
-                    "잠시 후 다시 시도해주세요."
+                    "현재 버전은 분석 1회당 Gemini를 한 번만 호출합니다."
                 )
-            elif "API_KEY" in message or "401" in message or "403" in message:
+            elif "api_key" in lowered or "401" in message or "403" in message:
                 st.error(
-                    "Gemini API 키를 확인해주세요. "
-                    "Streamlit Secrets의 GEMINI_API_KEY 값이 올바른지 확인하면 됩니다."
+                    "Gemini API 키 또는 프로젝트 권한을 확인해주세요."
                 )
-            elif "404" in message or "not found" in message.lower():
+            elif "404" in message or "not found" in lowered:
                 st.error(
-                    "현재 프로젝트에서 해당 Gemini 모델을 사용할 수 없습니다. "
-                    "오류 상세의 모델명을 확인해주세요."
+                    "현재 프로젝트에서 이 Gemini 모델을 사용할 수 없습니다."
+                )
+            elif "json" in lowered or "schema" in lowered:
+                st.error(
+                    "AI 응답을 구조화하는 과정에서 오류가 발생했습니다. "
+                    "오류 상세를 확인해주세요."
                 )
             else:
                 st.error(
                     "사진 분석 중 오류가 발생했습니다. "
-                    "사진 수를 줄여 다시 시도해보세요."
+                    "아래 오류 상세를 확인해주세요."
                 )
 
             with st.expander("오류 상세 보기"):
