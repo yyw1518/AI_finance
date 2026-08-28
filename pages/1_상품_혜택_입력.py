@@ -34,6 +34,7 @@ st.info(
 # 설정
 # =========================================================
 MODEL_NAME = "gemini-3.7-flash"
+EXTRACTION_MODEL = "gemini-3.5-flash-lite"
 MAX_IMAGES = 6
 MAX_INLINE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_SIDE = 1600
@@ -736,12 +737,15 @@ def analyze_images(uploaded_files, progress_callback=None):
     if progress_callback:
         progress_callback(
             0.30,
-            "상품과 혜택 문구를 읽고 있습니다..."
+            "1/2 상품·가격·쿠폰 문구를 빠르게 읽고 있습니다..."
         )
 
     first_interaction = client.interactions.create(
-        model=MODEL_NAME,
+        model=EXTRACTION_MODEL,
         input=first_input,
+        generation_config={
+            "thinking_level": "minimal",
+        },
         response_format={
             "type": "text",
             "mime_type": "application/json",
@@ -757,7 +761,7 @@ def analyze_images(uploaded_files, progress_callback=None):
     if progress_callback:
         progress_callback(
             0.68,
-            "혜택 적용 범위와 중복 조건을 정리하고 있습니다..."
+            "2/2 적용 범위와 중복 조건을 정리하고 있습니다..."
         )
 
     # -----------------------------------------------------
@@ -773,6 +777,9 @@ def analyze_images(uploaded_files, progress_callback=None):
                 ),
             }
         ],
+        generation_config={
+            "thinking_level": "low",
+        },
         response_format={
             "type": "text",
             "mime_type": "application/json",
@@ -826,6 +833,9 @@ def interpret_user_condition(note, benefit_df, product_df):
                 ),
             }
         ],
+        generation_config={
+            "thinking_level": "low",
+        },
         response_format={
             "type": "text",
             "mime_type": "application/json",
