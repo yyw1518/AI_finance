@@ -147,6 +147,44 @@ LIGHT_EXTRACTION_PROMPT = """
 - 적용 대상을 확실히 알 수 없으면 scope_type="unknown", scope_confidence="low".
 - 사진에 없는 내용을 억지로 만들지 마세요.
 - warnings는 반드시 친절한 존댓말로 작성하세요.
+
+반드시 아래 키를 가진 JSON 객체 하나만 반환하세요:
+{
+  "store_name": "",
+  "products": [
+    {
+      "name": "",
+      "brand": "",
+      "seller": "",
+      "category": "",
+      "price": 0,
+      "quantity": 1,
+      "price_known": true
+    }
+  ],
+  "benefits": [
+    {
+      "name": "",
+      "category": "",
+      "issuer": "",
+      "discount_type": "",
+      "value": 0,
+      "min_purchase": 0,
+      "max_discount": 0,
+      "channel": "",
+      "expiry": "",
+      "required_payment_method": "",
+      "excluded_items": "",
+      "raw_conditions": "",
+      "scope_type": "cart",
+      "scope_targets": [],
+      "scope_confidence": "high"
+    }
+  ],
+  "warnings": []
+}
+
+추가 설명, 마크다운, 코드블록 없이 JSON만 반환하세요.
 """
 
 
@@ -803,10 +841,10 @@ def finalize_first_pass_locally(first_result):
         "store_name": str(
             first_result.get("store_name", "")
         ).strip(),
-        "products": products,
-        "benefits": benefits,
+        "products": products if isinstance(products, list) else [],
+        "benefits": benefits if isinstance(benefits, list) else [],
         "benefit_relations": [],
-        "warnings": warnings,
+        "warnings": warnings if isinstance(warnings, list) else [],
     }
 
 
@@ -877,7 +915,6 @@ def analyze_images(uploaded_files, progress_callback=None):
         contents=first_contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=LIGHT_EXTRACTION_SCHEMA,
         ),
     )
 
@@ -886,7 +923,20 @@ def analyze_images(uploaded_files, progress_callback=None):
             "1차 이미지 분석 응답이 비어 있습니다."
         )
 
-    first_result = json.loads(first_response.text)
+    raw_text = first_response.text.strip()
+
+    # 모델이 ```json ... ``` 형태로 감싸는 경우까지 안전하게 처리
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```(?:json)?\\s*", "", raw_text)
+        raw_text = re.sub(r"\\s*```$", "", raw_text)
+
+    try:
+        first_result = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Gemini 응답을 JSON으로 읽지 못했습니다. "
+            f"응답 시작 부분: {raw_text[:500]}"
+        ) from exc
 
     if progress_callback:
         progress_callback(
@@ -1332,7 +1382,8 @@ if st.button(
                 )
             elif "json" in lowered or "schema" in lowered:
                 st.error(
-                    "AI 응답을 구조화하는 과정에서 오류가 발생했습니다. "
+                    "AI 응답 형식을 읽는 과정에서 오류가 발생했습니다. "
+                    "이번 버전은 엄격한 스키마 출력을 사용하지 않도록 수정했습니다. "
                     "오류 상세를 확인해주세요."
                 )
             else:
