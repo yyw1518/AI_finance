@@ -1282,7 +1282,23 @@ def ai_benefits_to_df(benefits):
 
     for benefit in benefits:
         min_purchase_display = benefit.get("min_purchase", 0) if benefit.get("min_purchase_known", False) else 0
-        max_discount_display = benefit.get("max_discount", 0) if benefit.get("max_discount_known", False) else 0
+        discount_type_code = str(
+            benefit.get("discount_type", "")
+        ).strip().lower()
+
+        max_discount_value = float(
+            benefit.get("max_discount", 0) or 0
+        )
+
+        if discount_type_code == "percent":
+            max_discount_display = (
+                int(max_discount_value)
+                if max_discount_value > 0
+                else "제한 없음"
+            )
+        else:
+            # 정액 할인/포인트/무료배송 등은 최대할인금액 개념이 불필요
+            max_discount_display = "-"
 
         rows.append(
             {
@@ -1329,7 +1345,7 @@ def ai_benefits_to_df(benefits):
                 "할인값확인": "확인 필요",
                 "최소결제금액": 0,
                 "최소금액확인": "확인 필요",
-                "최대할인금액": 0,
+                "최대할인금액": "-",
                 "최대할인확인": "확인 필요",
                 "쿠폰중복": "확인 필요",
                 "멤버십중복": "확인 필요",
@@ -1634,7 +1650,13 @@ if "gemini_analysis_result" in st.session_state:
             "할인방식": st.column_config.SelectboxColumn("할인방식", options=list(DISCOUNT_TO_KR.values())),
             "할인값": st.column_config.NumberColumn("할인값", min_value=0, format="localized"),
             "최소결제금액": st.column_config.NumberColumn("최소결제금액", min_value=0, step=1000, format="localized"),
-            "최대할인금액": st.column_config.NumberColumn("최대할인금액", min_value=0, step=1000, format="localized"),
+            "최대할인금액": st.column_config.TextColumn(
+                "최대할인금액",
+                help=(
+                    "정액 할인·포인트 적립에는 별도 상한이 없어 '-'로 표시합니다. "
+                    "퍼센트 할인에 상한이 없으면 '제한 없음'으로 표시합니다."
+                ),
+            ),
             "사용채널": st.column_config.SelectboxColumn("사용채널", options=list(CHANNEL_TO_KR.values())),
             "유효기간": st.column_config.TextColumn("유효기간"),
         },
@@ -1946,7 +1968,11 @@ if "gemini_analysis_result" in st.session_state:
                 extra_condition_notes.append("AI 확인 필요: 할인값 미확인")
             if not min_known:
                 extra_condition_notes.append("AI 확인 필요: 최소결제금액 미확인")
-            if not max_known:
+            if (
+                str(row.get("할인방식", "")).strip()
+                not in {"정액(원)", "포인트/적립", "무료배송"}
+                and not max_known
+            ):
                 extra_condition_notes.append("AI 확인 필요: 최대할인금액 미확인")
             if row.get("분할결제재사용") == "확인 필요":
                 extra_condition_notes.append("AI 확인 필요: 분할결제 재사용 여부 미확인")
@@ -1972,8 +1998,18 @@ if "gemini_analysis_result" in st.session_state:
                     "value_known": value_known,
                     "min_purchase": clean_number(row.get("최소결제금액", 0)),
                     "min_purchase_known": min_known,
-                    "max_discount": clean_number(row.get("최대할인금액", 0)),
-                    "max_discount_known": max_known,
+                    "max_discount": (
+                        0
+                        if str(row.get("최대할인금액", "")).strip()
+                        in {"", "-", "제한 없음"}
+                        else clean_number(row.get("최대할인금액", 0))
+                    ),
+                    "max_discount_known": (
+                        True
+                        if str(row.get("할인방식", "")).strip()
+                        in {"정액(원)", "포인트/적립", "무료배송"}
+                        else max_known
+                    ),
                     "stack_coupon": label_to_bool(row.get("쿠폰중복", "확인 필요")),
                     "stack_coupon_label": row.get("쿠폰중복", "확인 필요"),
                     "stack_membership": label_to_bool(row.get("멤버십중복", "확인 필요")),
