@@ -35,6 +35,12 @@ def money(value):
     return f"{int(round(value)):,}원"
 
 
+def parse_money_input(value):
+    text = str(value).replace(",", "").replace("원", "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else 0
+
+
 # =========================================================
 # 익명 사용자 키
 # - 로그인 없는 MVP에서도 사용자별 월 데이터를 분리하기 위한 키
@@ -319,30 +325,33 @@ st.caption("이번 달 기준으로 아래 세 가지만 입력해주세요.")
 c1, c2 = st.columns(2)
 
 with c1:
-    usable_money = st.number_input(
+    usable_money_text = st.text_input(
         "이번 달 쓸 수 있는 돈",
-        min_value=0,
-        value=default_usable,
-        step=10_000,
+        value=f"{default_usable:,}",
         help="월급·용돈·생활비 등 이번 달에 실제로 사용할 수 있는 총 금액입니다.",
+        placeholder="예: 1,000,000",
     )
+    usable_money = parse_money_input(usable_money_text)
+    st.caption(f"입력 금액: **{money(usable_money)}**")
 
-    spent_so_far = st.number_input(
+    spent_so_far_text = st.text_input(
         "지금까지 쓴 돈",
-        min_value=0,
-        value=default_spent,
-        step=10_000,
+        value=f"{default_spent:,}",
         help="이번 달 시작일부터 지금까지 이미 사용한 금액입니다.",
+        placeholder="예: 400,000",
     )
+    spent_so_far = parse_money_input(spent_so_far_text)
+    st.caption(f"입력 금액: **{money(spent_so_far)}**")
 
 with c2:
-    essential_remaining = st.number_input(
+    essential_remaining_text = st.text_input(
         "앞으로 꼭 나갈 돈",
-        min_value=0,
-        value=default_essential,
-        step=10_000,
+        value=f"{default_essential:,}",
         help="이번 달 남은 기간에 반드시 지출해야 하는 교통비·통신비·월세·식비 등의 금액입니다.",
+        placeholder="예: 200,000",
     )
+    essential_remaining = parse_money_input(essential_remaining_text)
+    st.caption(f"입력 금액: **{money(essential_remaining)}**")
 
     # 입력과 동시에 사용자가 현재 상태를 이해할 수 있도록 간단한 미리보기
     disposable_before = (
