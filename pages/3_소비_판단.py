@@ -425,6 +425,7 @@ else:
         use_container_width=True,
     )
 
+
 if analyze:
     data = {
         "usable_money": usable_money,
@@ -432,20 +433,12 @@ if analyze:
         "essential_remaining": essential_remaining,
     }
 
- if st.session_state.get("demo_mode", False):
+    # 데모 모드에서는 샘플 금융정보를 실제 저장소에 저장하지 않음
+    if st.session_state.get("demo_mode", False):
+        save_mode = "demo"
+    else:
+        save_mode = save_monthly_data(data)
 
-    save_mode = "demo"
-
-else:
-
-if st.session_state.get("demo_mode", False):
-
-    save_mode = "demo"
-
-else:
-
-    save_mode = save_monthly_data(data)
-    
     # 같은 세션에서도 즉시 재사용
     st.session_state["monthly_finance"] = {
         "year_month": CURRENT_MONTH,
@@ -464,7 +457,9 @@ else:
     available_after = available_before - optimized_price
 
     if usable_money <= 0:
-        st.warning("이번 달 쓸 수 있는 돈을 입력하면 소비 가능 여부를 판단할 수 있습니다.")
+        st.warning(
+            "이번 달 쓸 수 있는 돈을 입력하면 소비 가능 여부를 판단할 수 있습니다."
+        )
 
     elif spent_so_far + essential_remaining > usable_money:
         shortage = (
@@ -473,24 +468,43 @@ else:
             - usable_money
         )
 
-        st.error("🔴 지금은 추가 소비보다 필수 지출을 먼저 확보하는 편이 좋습니다.")
+        st.error(
+            "🔴 지금은 추가 소비보다 필수 지출을 먼저 확보하는 편이 좋습니다."
+        )
+
         st.write(
             f"현재 입력 기준으로 이미 쓴 돈과 앞으로 꼭 나갈 돈이 "
             f"이번 달 가용금액을 **{money(shortage)} 초과**합니다."
         )
 
     elif optimized_price <= 0:
-        st.warning("최적 결제금액이 없어 현재 구매에 대한 판단을 계산할 수 없습니다.")
+        st.warning(
+            "최적 결제금액이 없어 현재 구매에 대한 판단을 계산할 수 없습니다."
+        )
 
     elif available_after < 0:
         shortage = abs(available_after)
 
-        st.error("🔴 이 구매를 하면 이번 달 예정된 필수 지출까지 감당하기 어렵습니다.")
+        st.error(
+            "🔴 이 구매를 하면 이번 달 예정된 필수 지출까지 감당하기 어렵습니다."
+        )
 
         a, b, c = st.columns(3)
-        a.metric("구매 전 자유자금", money(available_before))
-        b.metric("이번 구매", money(optimized_price))
-        c.metric("부족 금액", money(shortage))
+
+        a.metric(
+            "구매 전 자유자금",
+            money(available_before)
+        )
+
+        b.metric(
+            "이번 구매",
+            money(optimized_price)
+        )
+
+        c.metric(
+            "부족 금액",
+            money(shortage)
+        )
 
     else:
         use_ratio = (
@@ -499,7 +513,9 @@ else:
             else 0
         )
 
-        st.success("🟢 현재 입력한 이번 달 계획 안에서는 결제 가능한 소비입니다.")
+        st.success(
+            "🟢 현재 입력한 이번 달 계획 안에서는 결제 가능한 소비입니다."
+        )
 
         a, b, c = st.columns(3)
 
@@ -532,26 +548,28 @@ else:
                 "혜택을 확보하면서 구매할 수 있습니다."
             )
 
+    # 저장 안내
     if save_mode == "demo":
 
-    st.caption(
-        "🧪 현재 결과는 심사용 샘플 금융정보를 이용한 결과입니다."
-    )
+        st.caption(
+            "🧪 현재 결과는 심사용 샘플 금융정보를 이용한 결과입니다."
+        )
 
     elif save_mode == "supabase":
 
-    st.caption(
-        f"💾 {CURRENT_MONTH_LABEL} 입력값이 저장되었습니다. "
-        "이번 달에 다시 방문하면 자동으로 불러옵니다."
-    )
+        st.caption(
+            f"💾 {CURRENT_MONTH_LABEL} 입력값이 저장되었습니다. "
+            "이번 달에 다시 방문하면 자동으로 불러옵니다."
+        )
 
     else:
 
-    st.caption(
-        f"💾 {CURRENT_MONTH_LABEL} 입력값을 저장했습니다. "
-        "현재 MVP 환경에서는 앱 서버가 재배포되면 "
-        "로컬 저장값이 초기화될 수 있습니다."
-    )
+        st.caption(
+            f"💾 {CURRENT_MONTH_LABEL} 입력값을 저장했습니다. "
+            "현재 MVP 환경에서는 앱 서버가 재배포되면 "
+            "로컬 저장값이 초기화될 수 있습니다."
+        )
+
     # 4번 페이지에서 그대로 사용
     st.session_state["finance_available_before_purchase"] = available_before
     st.session_state["finance_available_after_purchase"] = available_after
