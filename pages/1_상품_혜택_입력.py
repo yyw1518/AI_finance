@@ -1,6 +1,9 @@
 import base64
 import json
 import re
+from io import BytesIO
+
+from PIL import Image
 
 import pandas as pd
 import streamlit as st
@@ -32,7 +35,9 @@ st.info(
 # =========================================================
 MODEL_NAME = "gemini-3-flash-preview"
 MAX_IMAGES = 6
-MAX_INLINE_BYTES = 18 * 1024 * 1024  # 18MB: API 20MB inline 한도보다 여유 있게
+MAX_INLINE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_SIDE = 1600
+JPEG_QUALITY = 82
 
 
 # =========================================================
@@ -49,6 +54,144 @@ def get_gemini_client():
 # =========================================================
 # JSON Schema
 # =========================================================
+# 1차 이미지 판독은 "보이는 사실"만 빠르게 추출합니다.
+# 복잡한 중복관계/택일관계 추론은 2차 텍스트 분석으로 넘깁니다.
+LIGHT_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "store_name": {"type": "string"},
+        "products": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "brand": {"type": "string"},
+                    "seller": {"type": "string"},
+                    "category": {"type": "string"},
+                    "price": {"type": "number"},
+                    "quantity": {"type": "integer"},
+                    "price_known": {"type": "boolean"},
+                },
+                "required": [
+                    "name", "brand", "seller", "category",
+                    "price", "quantity", "price_known"
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "benefits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "category": {"type": "string"},
+                    "issuer": {"type": "string"},
+                    "discount_type": {"type": "string"},
+                    "value": {"type": "number"},
+                    "min_purchase": {"type": "number"},
+                    "max_discount": {"type": "number"},
+                    "channel": {"type": "string"},
+                    "expiry": {"type": "string"},
+                    "required_payment_method": {"type": "string"},
+                    "excluded_items": {"type": "string"},
+                    "raw_conditions": {"type": "string"},
+                    "scope_type": {
+                        "type": "string",
+                        "enum": ["cart", "brand", "product", "seller", "category", "unknown"],
+                    },
+                    "scope_targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "scope_confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": [
+                    "name", "category", "issuer", "discount_type",
+                    "value", "min_purchase", "max_discount",
+                    "channel", "expiry", "required_payment_method",
+                    "excluded_items", "raw_conditions",
+                    "scope_type", "scope_targets", "scope_confidence"
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["store_name", "products", "benefits", "warnings"],
+    "additionalProperties": False,
+}
+
+
+LIGHT_EXTRACTION_PROMPT = """
+업로드된 쇼핑 화면에서 눈에 보이는 사실만 빠르게 구조화하세요.
+
+목표:
+1) 상품명/브랜드/판매자/카테고리/가격/수량
+2) 쿠폰·카드·간편결제·멤버십 등의 혜택명과 숫자 조건
+3) 화면에 직접 드러난 적용 범위(scope)
+
+중요:
+- 이 단계에서는 혜택끼리 중복 가능한지, 택1인지 등 복잡한 관계를 추론하지 마세요.
+- 화면에 보이는 문구를 우선 정확하게 읽으세요.
+- 적용 범위가 명확하면 cart/brand/product/seller/category로 분류하세요.
+- 적용 대상을 확실히 알 수 없으면 scope_type="unknown", scope_confidence="low".
+- 사진에 없는 내용을 억지로 만들지 마세요.
+- warnings는 반드시 친절한 존댓말로 작성하세요.
+"""
+
+
+def compress_image_for_ai(uploaded_file):
+    """휴대폰 캡처를 AI 판독에 충분한 크기로 축소해 전송량을 줄입니다."""
+    raw = uploaded_file.getvalue()
+
+    try:
+        image = Image.open(BytesIO(raw))
+        image = image.convert("RGB")
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+
+        output = BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=JPEG_QUALITY,
+            optimize=True,
+        )
+        return output.getvalue(), "image/jpeg"
+    except Exception:
+        # 변환 실패 시 원본을 사용합니다.
+        return raw, uploaded_file.type or "image/png"
+
+
+def build_second_pass_prompt(first_result):
+    return f"""
+아래 JSON은 쇼핑 캡처를 1차로 읽어 추출한 결과입니다.
+이미지를 다시 읽지 말고 이 JSON의 텍스트 정보만 사용해 최종 혜택 구조를 완성하세요.
+
+[1차 추출 결과]
+{json.dumps(first_result, ensure_ascii=False)}
+
+해야 할 일:
+- 기존 상품/혜택을 빠뜨리지 말고 최종 스키마로 변환하세요.
+- scope_type/scope_targets를 문구와 상품 정보를 종합해 정리하세요.
+- 동일 이벤트의 금액대별 단계형 혜택은 같은 exclusive_group으로 묶으세요.
+- 혜택 간 중복 가능/불가 관계는 근거가 있는 경우에만 benefit_relations에 기록하세요.
+- 직접 문구가 있으면 high, 구조상 합리적 추론이면 medium, 근거가 약하면 low로 두세요.
+- 사용자가 나중에 검수할 수 있으므로 애매한 범위를 억지로 확정하지 마세요.
+- 사진 원문에 없는 새로운 할인율/금액/기간을 만들어내지 마세요.
+
+아래의 기존 최종 분석 규칙도 따르세요:
+{ANALYSIS_PROMPT}
+"""
+
+
 EXTRACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -519,7 +662,7 @@ scope_targets에는 실제 대상명만 넣는다.
 # =========================================================
 # Gemini 호출
 # =========================================================
-def analyze_images(uploaded_files):
+def analyze_images(uploaded_files, progress_callback=None):
     client = get_gemini_client()
 
     if client is None:
@@ -528,41 +671,108 @@ def analyze_images(uploaded_files):
         )
 
     selected_files = uploaded_files[:MAX_IMAGES]
-    total_bytes = sum(len(file.getvalue()) for file in selected_files)
 
-    if total_bytes > MAX_INLINE_BYTES:
-        raise RuntimeError(
-            "업로드한 이미지의 총 용량이 큽니다. 이미지 수를 줄이거나 캡처 크기를 줄여 다시 시도해주세요."
-        )
+    # -----------------------------------------------------
+    # 0단계: 이미지 자동 축소
+    # -----------------------------------------------------
+    prepared_images = []
 
-    interaction_input = [
-        {
-            "type": "text",
-            "text": ANALYSIS_PROMPT,
-        }
-    ]
-
-    for index, image in enumerate(selected_files, start=1):
-        mime_type = image.type or "image/png"
-        encoded = base64.b64encode(image.getvalue()).decode("utf-8")
-
-        interaction_input.append(
+    for image in selected_files:
+        compressed_bytes, mime_type = compress_image_for_ai(image)
+        prepared_images.append(
             {
-                "type": "text",
-                "text": f"이미지 {index}: {image.name}",
-            }
-        )
-        interaction_input.append(
-            {
-                "type": "image",
-                "data": encoded,
+                "name": image.name,
+                "bytes": compressed_bytes,
                 "mime_type": mime_type,
             }
         )
 
-    interaction = client.interactions.create(
+    total_bytes = sum(
+        len(item["bytes"])
+        for item in prepared_images
+    )
+
+    if total_bytes > MAX_INLINE_BYTES:
+        raise RuntimeError(
+            "이미지를 자동으로 줄였지만 총 용량이 아직 큽니다. "
+            "사진 수를 줄여 다시 시도해주세요."
+        )
+
+    if progress_callback:
+        progress_callback(
+            0.15,
+            "이미지를 분석하기 좋은 크기로 준비했습니다."
+        )
+
+    # -----------------------------------------------------
+    # 1단계: 이미지에서 보이는 정보만 빠르게 추출
+    # -----------------------------------------------------
+    first_input = [
+        {
+            "type": "text",
+            "text": LIGHT_EXTRACTION_PROMPT,
+        }
+    ]
+
+    for index, item in enumerate(prepared_images, start=1):
+        encoded = base64.b64encode(
+            item["bytes"]
+        ).decode("utf-8")
+
+        first_input.append(
+            {
+                "type": "text",
+                "text": f"이미지 {index}: {item['name']}",
+            }
+        )
+        first_input.append(
+            {
+                "type": "image",
+                "data": encoded,
+                "mime_type": item["mime_type"],
+            }
+        )
+
+    if progress_callback:
+        progress_callback(
+            0.30,
+            "상품과 혜택 문구를 읽고 있습니다..."
+        )
+
+    first_interaction = client.interactions.create(
         model=MODEL_NAME,
-        input=interaction_input,
+        input=first_input,
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": LIGHT_EXTRACTION_SCHEMA,
+        },
+        store=False,
+    )
+
+    first_result = json.loads(
+        first_interaction.output_text
+    )
+
+    if progress_callback:
+        progress_callback(
+            0.68,
+            "혜택 적용 범위와 중복 조건을 정리하고 있습니다..."
+        )
+
+    # -----------------------------------------------------
+    # 2단계: 이미지는 보내지 않고 1차 JSON만 관계 분석
+    # -----------------------------------------------------
+    second_interaction = client.interactions.create(
+        model=MODEL_NAME,
+        input=[
+            {
+                "type": "text",
+                "text": build_second_pass_prompt(
+                    first_result
+                ),
+            }
+        ],
         response_format={
             "type": "text",
             "mime_type": "application/json",
@@ -571,7 +781,17 @@ def analyze_images(uploaded_files):
         store=False,
     )
 
-    return json.loads(interaction.output_text)
+    final_result = json.loads(
+        second_interaction.output_text
+    )
+
+    if progress_callback:
+        progress_callback(
+            1.0,
+            "분석이 완료되었습니다."
+        )
+
+    return final_result
 
 
 
@@ -931,44 +1151,72 @@ if st.button(
     if not uploaded_files:
         st.warning("먼저 사진을 1장 이상 올려주세요.")
     else:
-        with st.spinner("Gemini가 상품과 혜택 조건을 읽고 있습니다..."):
-            try:
-                result = analyze_images(uploaded_files)
-                st.session_state["gemini_analysis_result"] = result
-                st.session_state["gemini_products"] = result.get("products", [])
-                st.session_state["gemini_benefits"] = result.get("benefits", [])
-                st.session_state["gemini_warnings"] = result.get("warnings", [])
-                st.session_state["gemini_ai_relations_raw"] = result.get(
-                    "benefit_relations", []
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+
+        def update_analysis_progress(value, text):
+            progress_bar.progress(
+                min(max(float(value), 0.0), 1.0)
+            )
+            progress_text.caption(text)
+
+        try:
+            update_analysis_progress(
+                0.05,
+                "업로드한 이미지를 준비하고 있습니다..."
+            )
+            result = analyze_images(
+                uploaded_files,
+                progress_callback=update_analysis_progress,
+            )
+
+            st.session_state["gemini_analysis_result"] = result
+            st.session_state["gemini_products"] = result.get("products", [])
+            st.session_state["gemini_benefits"] = result.get("benefits", [])
+            st.session_state["gemini_warnings"] = result.get("warnings", [])
+            st.session_state["gemini_ai_relations_raw"] = result.get(
+                "benefit_relations", []
+            )
+            st.session_state["benefit_working_df"] = ai_benefits_to_df(
+                result.get("benefits", [])
+            )
+            st.session_state["product_working_df"] = ai_products_to_df(
+                result.get("products", [])
+            )
+
+            detected_store = result.get("store_name", "").strip()
+            if detected_store:
+                st.session_state["gemini_store_name"] = detected_store
+
+            progress_bar.progress(1.0)
+            progress_text.caption("✅ 분석 완료")
+            st.success(
+                f"✅ 상품 {len(result.get('products', []))}개, "
+                f"혜택 {len(result.get('benefits', []))}개를 찾았습니다."
+            )
+
+        except Exception as error:
+            message = str(error)
+            progress_text.caption("분석을 완료하지 못했습니다.")
+
+            if "429" in message or "RESOURCE_EXHAUSTED" in message:
+                st.error(
+                    "Gemini API 사용 한도에 도달했습니다. "
+                    "잠시 후 다시 시도해주세요."
                 )
-                st.session_state["benefit_working_df"] = ai_benefits_to_df(result.get("benefits", []))
-                st.session_state["product_working_df"] = ai_products_to_df(result.get("products", []))
-
-                detected_store = result.get("store_name", "").strip()
-                if detected_store:
-                    st.session_state["gemini_store_name"] = detected_store
-
-                st.success(
-                    f"✅ 상품 {len(result.get('products', []))}개, "
-                    f"혜택 {len(result.get('benefits', []))}개를 찾았습니다."
+            elif "API_KEY" in message or "401" in message or "403" in message:
+                st.error(
+                    "Gemini API 키를 확인해주세요. "
+                    "Streamlit Secrets의 GEMINI_API_KEY 값이 올바른지 확인하면 됩니다."
+                )
+            else:
+                st.error(
+                    "사진 분석 중 오류가 발생했습니다. "
+                    "사진 수를 줄여 다시 시도해보세요."
                 )
 
-            except Exception as error:
-                message = str(error)
-
-                if "429" in message or "RESOURCE_EXHAUSTED" in message:
-                    st.error(
-                        "Gemini 무료 API 사용 한도에 도달했습니다. 잠시 후 다시 시도하거나 다음 한도 갱신 후 다시 시도해주세요."
-                    )
-                elif "API_KEY" in message or "401" in message or "403" in message:
-                    st.error(
-                        "Gemini API 키를 확인해주세요. Streamlit Secrets의 GEMINI_API_KEY 값이 올바른지 확인하면 됩니다."
-                    )
-                else:
-                    st.error("사진 분석 중 오류가 발생했습니다.")
-
-                with st.expander("오류 상세 보기"):
-                    st.code(message)
+            with st.expander("오류 상세 보기"):
+                st.code(message)
 
 
 # =========================================================
