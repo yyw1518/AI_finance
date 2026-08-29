@@ -10,6 +10,20 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
+# --------------------------------------
+import base64
+import json
+import re
+import mimetypes
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image
+
+import pandas as pd
+import streamlit as st
+from google import genai
+from google.genai import types
 
 # =========================================================
 # 페이지 설정
@@ -41,6 +55,29 @@ MAX_INLINE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_SIDE = 1600
 JPEG_QUALITY = 82
 
+# =========================================================
+# 심사용 샘플 이미지 데모 설정
+# main.py의 SHOW_DEMO 값을 받아서 사용합니다.
+# =========================================================
+SHOW_DEMO = st.session_state.get(
+    "show_demo",
+    False,
+)
+
+# pages 폴더의 한 단계 위 = 프로젝트 최상위 폴더
+DEMO_IMAGE_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "demo_images"
+)
+
+# 심사용으로 사용할 5장
+DEMO_IMAGE_NAMES = [
+    "01_cart.png",
+    "02_coupons.png",
+    "03_naverpay.jpeg",
+    "04_kakaopay.png",
+    "05_tosspay.png",
+]
 
 # =========================================================
 # Gemini 클라이언트
@@ -52,7 +89,53 @@ def get_gemini_client():
     except Exception:
         return None
 
+# =========================================================
+# 심사용 샘플 이미지를 일반 업로드 파일처럼 사용하기
+# =========================================================
+class DemoUploadedFile:
 
+    def __init__(self, path):
+        self.path = Path(path)
+        self.name = self.path.name
+
+        guessed_type, _ = mimetypes.guess_type(
+            self.name
+        )
+
+        self.type = (
+            guessed_type
+            or "image/png"
+        )
+
+        self._data = self.path.read_bytes()
+
+
+    def getvalue(self):
+        return self._data
+
+
+def load_demo_files():
+
+    demo_files = []
+    missing_files = []
+
+    for file_name in DEMO_IMAGE_NAMES:
+
+        path = (
+            DEMO_IMAGE_DIR
+            / file_name
+        )
+
+        if not path.exists():
+            missing_files.append(file_name)
+            continue
+
+        demo_files.append(
+            DemoUploadedFile(path)
+        )
+
+    return demo_files, missing_files
+    
 # =========================================================
 # JSON Schema
 # =========================================================
@@ -1411,131 +1494,371 @@ def clean_number(value):
     except (TypeError, ValueError):
         return 0.0
 
-
 # =========================================================
 # 1. 이미지 업로드
 # =========================================================
 st.header("1️⃣ 사진 업로드")
+
 st.write(
-    "장바구니/상품 화면과 내가 가진 쿠폰·통신사·카드·간편결제 혜택 캡처를 함께 올려주세요. "
+    "장바구니/상품 화면과 내가 가진 쿠폰·통신사·카드·간편결제 혜택 "
+    "캡처를 함께 올려주세요. "
     "상품 화면이 없으면 분석 후 상품 표에서 직접 추가할 수 있습니다."
 )
 
-uploaded_files = st.file_uploader(
-    "상품·혜택 캡처 업로드",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True,
-    help=f"한 번에 최대 {MAX_IMAGES}장까지 분석합니다.",
+
+# =========================================================
+# 현재 데모 모드인지 확인
+# =========================================================
+demo_image_mode = (
+    SHOW_DEMO
+    and st.session_state.get(
+        "demo_image_mode",
+        False,
+    )
 )
 
-if uploaded_files:
-    if len(uploaded_files) > MAX_IMAGES:
-        st.warning(f"현재는 앞의 {MAX_IMAGES}장만 분석합니다.")
 
-    preview_files = uploaded_files[:MAX_IMAGES]
-    preview_cols = st.columns(3)
+# Gemini에 최종적으로 전달할 이미지 목록
+files_for_analysis = []
 
-    for idx, image in enumerate(preview_files):
-        with preview_cols[idx % 3]:
-            st.image(image, caption=image.name, width="stretch")
+
+# =========================================================
+# 데모 모드
+# =========================================================
+if demo_image_mode:
+
+    demo_files, missing_files = load_demo_files()
+
+    if missing_files:
+
+        st.error(
+            "샘플 이미지가 모두 준비되지 않았습니다."
+        )
+
+        st.write(
+            "demo_images 폴더에서 아래 파일을 확인해주세요."
+        )
+
+        for file_name in missing_files:
+            st.write(f"- {file_name}")
+
+    else:
+
+        files_for_analysis = demo_files
+
+        st.success(
+            "🧪 샘플 장바구니·쿠폰·결제혜택 이미지 5장을 "
+            "자동으로 불러왔습니다."
+        )
+
+        st.caption(
+            "아래 사진의 분석 결과를 미리 입력해두는 것이 아니라, "
+            "Gemini AI가 실제로 5장의 이미지를 분석합니다."
+        )
+
+        preview_cols = st.columns(3)
+
+        for idx, image in enumerate(demo_files):
+
+            with preview_cols[idx % 3]:
+
+                st.image(
+                    image.getvalue(),
+                    caption=image.name,
+                    width="stretch",
+                )
+
+
+    if st.button(
+        "↩️ 직접 사진 업로드로 돌아가기",
+        width="stretch",
+    ):
+
+        st.session_state["demo_mode"] = False
+        st.session_state["demo_image_mode"] = False
+
+        st.session_state.pop(
+            "auto_run_demo_analysis",
+            None,
+        )
+
+        st.rerun()
+
+
+# =========================================================
+# 일반 사용자 모드
+# =========================================================
+else:
+
+    uploaded_files = st.file_uploader(
+        "상품·혜택 캡처 업로드",
+        type=[
+            "png",
+            "jpg",
+            "jpeg",
+            "webp",
+        ],
+        accept_multiple_files=True,
+        help=f"한 번에 최대 {MAX_IMAGES}장까지 분석합니다.",
+    )
+
+    if uploaded_files:
+
+        if len(uploaded_files) > MAX_IMAGES:
+
+            st.warning(
+                f"현재는 앞의 {MAX_IMAGES}장만 분석합니다."
+            )
+
+        files_for_analysis = (
+            uploaded_files[:MAX_IMAGES]
+        )
+
+        preview_cols = st.columns(3)
+
+        for idx, image in enumerate(
+            files_for_analysis
+        ):
+
+            with preview_cols[idx % 3]:
+
+                st.image(
+                    image,
+                    caption=image.name,
+                    width="stretch",
+                )
+
 
 st.caption(
-    "개인정보 보호를 위해 카드번호·이름·계좌번호 등 분석에 필요 없는 정보는 가리고 올리는 것을 권장합니다."
+    "개인정보 보호를 위해 카드번호·이름·계좌번호 등 "
+    "분석에 필요 없는 정보는 가리고 올리는 것을 권장합니다."
 )
 
 st.divider()
-
 
 # =========================================================
 # 2. AI 분석
 # =========================================================
 st.header("2️⃣ Gemini AI 자동 분석")
 
-if st.button(
-    "✨ 사진에서 상품·혜택 자동 추출",
+
+# 일반 사용자는 버튼을 눌러 분석
+# 데모 사용자는 main.py에서 최초 1회 자동 분석
+manual_analysis_clicked = st.button(
+    (
+        "🔄 샘플 이미지 다시 분석"
+        if demo_image_mode
+        else "✨ 사진에서 상품·혜택 자동 추출"
+    ),
     type="primary",
     width="stretch",
-):
-    if not uploaded_files:
-        st.warning("먼저 사진을 1장 이상 올려주세요.")
+)
+
+
+# main.py에서 샘플 데모를 시작했을 때만
+# 최초 1회 자동으로 True가 됩니다.
+auto_demo_analysis = (
+    SHOW_DEMO
+    and st.session_state.pop(
+        "auto_run_demo_analysis",
+        False,
+    )
+)
+
+
+run_analysis = (
+    manual_analysis_clicked
+    or auto_demo_analysis
+)
+
+
+if run_analysis:
+
+    if not files_for_analysis:
+
+        st.warning(
+            "분석할 이미지가 없습니다."
+        )
+
     else:
+
         progress_bar = st.progress(0)
         progress_text = st.empty()
 
+
         def update_analysis_progress(value, text):
+
             progress_bar.progress(
-                min(max(float(value), 0.0), 1.0)
+                min(
+                    max(float(value), 0.0),
+                    1.0,
+                )
             )
+
             progress_text.caption(text)
 
+
         try:
+
             update_analysis_progress(
                 0.05,
                 "업로드한 이미지를 준비하고 있습니다..."
             )
+
+
             result = analyze_images(
-                uploaded_files,
+                files_for_analysis,
                 progress_callback=update_analysis_progress,
             )
 
-            st.session_state["gemini_analysis_result"] = result
-            st.session_state["gemini_products"] = result.get("products", [])
-            st.session_state["gemini_benefits"] = result.get("benefits", [])
-            st.session_state["gemini_warnings"] = result.get("warnings", [])
-            st.session_state["gemini_ai_relations_raw"] = result.get(
-                "benefit_relations", []
-            )
-            st.session_state["benefit_working_df"] = ai_benefits_to_df(
-                result.get("benefits", [])
-            )
-            st.session_state["product_working_df"] = ai_products_to_df(
-                result.get("products", [])
+
+            st.session_state[
+                "gemini_analysis_result"
+            ] = result
+
+            st.session_state[
+                "gemini_products"
+            ] = result.get(
+                "products",
+                [],
             )
 
-            detected_store = result.get("store_name", "").strip()
+            st.session_state[
+                "gemini_benefits"
+            ] = result.get(
+                "benefits",
+                [],
+            )
+
+            st.session_state[
+                "gemini_warnings"
+            ] = result.get(
+                "warnings",
+                [],
+            )
+
+            st.session_state[
+                "gemini_ai_relations_raw"
+            ] = result.get(
+                "benefit_relations",
+                [],
+            )
+
+
+            st.session_state[
+                "benefit_working_df"
+            ] = ai_benefits_to_df(
+                result.get(
+                    "benefits",
+                    [],
+                )
+            )
+
+
+            st.session_state[
+                "product_working_df"
+            ] = ai_products_to_df(
+                result.get(
+                    "products",
+                    [],
+                )
+            )
+
+
+            detected_store = result.get(
+                "store_name",
+                "",
+            ).strip()
+
+
             if detected_store:
-                st.session_state["gemini_store_name"] = detected_store
+
+                st.session_state[
+                    "gemini_store_name"
+                ] = detected_store
+
 
             progress_bar.progress(1.0)
-            progress_text.caption("✅ 분석 완료")
+
+            progress_text.caption(
+                "✅ 분석 완료"
+            )
+
+
             st.success(
                 f"✅ 상품 {len(result.get('products', []))}개, "
                 f"혜택 {len(result.get('benefits', []))}개를 찾았습니다."
             )
 
+
         except Exception as error:
+
             message = str(error)
-            progress_text.caption("분석을 완료하지 못했습니다.")
+
+            progress_text.caption(
+                "분석을 완료하지 못했습니다."
+            )
 
             lowered = message.lower()
 
-            if "429" in message or "resource_exhausted" in lowered:
+
+            if (
+                "429" in message
+                or "resource_exhausted" in lowered
+            ):
+
                 st.error(
                     "Gemini API 요청이 일시적으로 제한되었습니다. "
                     "현재 버전은 분석 1회당 Gemini를 한 번만 호출합니다."
                 )
-            elif "api_key" in lowered or "401" in message or "403" in message:
+
+
+            elif (
+                "api_key" in lowered
+                or "401" in message
+                or "403" in message
+            ):
+
                 st.error(
                     "Gemini API 키 또는 프로젝트 권한을 확인해주세요."
                 )
-            elif "404" in message or "not found" in lowered:
+
+
+            elif (
+                "404" in message
+                or "not found" in lowered
+            ):
+
                 st.error(
                     "현재 프로젝트에서 이 Gemini 모델을 사용할 수 없습니다."
                 )
-            elif "json" in lowered or "schema" in lowered:
+
+
+            elif (
+                "json" in lowered
+                or "schema" in lowered
+            ):
+
                 st.error(
                     "AI 응답 형식을 읽는 과정에서 오류가 발생했습니다. "
-                    "이번 버전은 엄격한 스키마 출력을 사용하지 않도록 수정했습니다. "
                     "오류 상세를 확인해주세요."
                 )
+
+
             else:
+
                 st.error(
                     "사진 분석 중 오류가 발생했습니다. "
                     "아래 오류 상세를 확인해주세요."
                 )
 
-            with st.expander("오류 상세 보기"):
+
+            with st.expander(
+                "오류 상세 보기"
+            ):
+
                 st.code(message)
+
 
 
 # =========================================================
